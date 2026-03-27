@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 load_dotenv()
 
-import requests
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from bs4 import BeautifulSoup
 from dateutil import parser as dateparser
 from google.auth.transport.requests import Request
@@ -175,15 +175,14 @@ def _extract_email_body(payload: dict) -> str:
 # 3. Web Archive Scraping
 # ===================================================================
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def _fetch_page(url: str) -> str:
-    """GET a URL with retries and return the response text."""
-    resp = requests.get(
-        url,
-        timeout=config.REQUEST_TIMEOUT,
-        headers={"User-Agent": "AI-Tools-Extractor/1.0"},
-    )
-    resp.raise_for_status()
-    return resp.text
+def _fetch_page(url: str, page) -> str:
+    """Navigate to a URL with Playwright and return the fully-rendered HTML."""
+    try:
+        page.goto(url, wait_until="networkidle", timeout=config.REQUEST_TIMEOUT * 1000)
+    except PlaywrightTimeoutError:
+        # networkidle can be slow on JS-heavy pages; fall back to domcontentloaded
+        page.goto(url, wait_until="domcontentloaded", timeout=config.REQUEST_TIMEOUT * 1000)
+    return page.content()
 
 
 def scrape_archives() -> list[dict]:
@@ -195,21 +194,40 @@ def scrape_archives() -> list[dict]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=config.LOOKBACK_DAYS)
     all_articles: list[dict] = []
 
-    for archive_url in config.ARCHIVE_URLS:
-        log.info("Scraping archive: %s", archive_url)
-        try:
-            articles = _scrape_single_archive(archive_url, cutoff)
-            log.info("  -> collected %d articles", len(articles))
-            all_articles.extend(articles)
-        except Exception:
-            log.exception("Failed to scrape %s — skipping.", archive_url)
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800},
+        )
+        page = context.new_page()
+        # Block images/fonts/media to speed up scraping
+        page.route(
+            "**/*",
+            lambda route: route.abort()
+            if route.request.resource_type in ("image", "media", "font")
+            else route.continue_(),
+        )
+
+        for archive_url in config.ARCHIVE_URLS:
+            log.info("Scraping archive: %s", archive_url)
+            try:
+                articles = _scrape_single_archive(archive_url, cutoff, page)
+                log.info("  -> collected %d articles", len(articles))
+                all_articles.extend(articles)
+            except Exception:
+                log.exception("Failed to scrape %s — skipping.", archive_url)
+
+        context.close()
+        browser.close()
 
     return all_articles
 
 
-def _scrape_single_archive(archive_url: str, cutoff: datetime) -> list[dict]:
+def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dict]:
     """Parse an archive page and fetch individual article content."""
-    html = _fetch_page(archive_url)
+    html = _fetch_page(archive_url, page)
     soup = BeautifulSoup(html, "html.parser")
     articles: list[dict] = []
 
@@ -223,7 +241,7 @@ def _scrape_single_archive(archive_url: str, cutoff: datetime) -> list[dict]:
             continue  # older than 14 days — skip
 
         try:
-            page_html = _fetch_page(url)
+            page_html = _fetch_page(url, page)
             page_soup = BeautifulSoup(page_html, "html.parser")
             # Try <article>, then main, then body
             article_tag = (
