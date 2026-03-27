@@ -8,7 +8,7 @@ categorise AI tools, and writes the results to Google Sheets.
 Usage:
     1. Place your Google OAuth `credentials.json` in the project root.
     2. Set SPREADSHEET_ID in config.py (or via env var SPREADSHEET_ID).
-    3. Export your OpenAI key:  export OPENAI_API_KEY="sk-..."
+    3. Export your Anthropic key:  export ANTHROPIC_API_KEY="sk-ant-..."
     4. Run:  python ai_tools_extractor.py
 """
 
@@ -27,7 +27,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from openai import OpenAI
+from anthropic import Anthropic
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 import config
@@ -377,28 +377,23 @@ def _chunk_text(text: str, max_chars: int) -> list[str]:
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
 def _llm_extract_tools(text_chunk: str) -> str:
     """Ask the LLM to list AI tools mentioned in a text chunk."""
-    client = OpenAI()
-    response = client.chat.completions.create(
+    client = Anthropic()
+    response = client.messages.create(
         model=config.LLM_MODEL,
         max_tokens=config.LLM_MAX_TOKENS,
         temperature=0.2,
-        messages=[
-            {
-                "role": "system",
-                "content": textwrap.dedent("""\
-                    You are an AI-tools analyst. Given newsletter content, extract
-                    every AI tool mentioned. For each tool output:
-                    - Tool Name
-                    - Sentiment (positive / neutral / negative)
-                    - Short description (1 sentence)
-                    - Source URL of the tool (if mentioned, else "N/A")
-                    Return the results as a JSON array of objects.
-                """),
-            },
-            {"role": "user", "content": text_chunk},
-        ],
+        system=textwrap.dedent("""\
+            You are an AI-tools analyst. Given newsletter content, extract
+            every AI tool mentioned. For each tool output:
+            - Tool Name
+            - Sentiment (positive / neutral / negative)
+            - Short description (1 sentence)
+            - Source URL of the tool (if mentioned, else "N/A")
+            Return the results as a JSON array of objects.
+        """),
+        messages=[{"role": "user", "content": text_chunk}],
     )
-    return response.choices[0].message.content
+    return response.content[0].text
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
@@ -450,18 +445,16 @@ def _llm_rank_and_categorise(mentions_text: str) -> dict:
         {mentions_text}
     """)
 
-    client = OpenAI()
-    response = client.chat.completions.create(
+    client = Anthropic()
+    response = client.messages.create(
         model=config.LLM_MODEL,
         max_tokens=config.LLM_MAX_TOKENS,
         temperature=0.1,
-        messages=[
-            {"role": "system", "content": "Return only valid JSON. No markdown."},
-            {"role": "user", "content": prompt},
-        ],
+        system="Return only valid JSON. No markdown.",
+        messages=[{"role": "user", "content": prompt}],
     )
 
-    raw = response.choices[0].message.content.strip()
+    raw = response.content[0].text.strip()
     # Strip markdown code fences if the model added them anyway
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
