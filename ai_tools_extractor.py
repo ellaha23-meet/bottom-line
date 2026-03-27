@@ -8,7 +8,7 @@ categorise AI tools, and writes the results to Google Sheets.
 Usage:
     1. Place your Google OAuth `credentials.json` in the project root.
     2. Set SPREADSHEET_ID in config.py (or via env var SPREADSHEET_ID).
-    3. Export your Anthropic key:  export ANTHROPIC_API_KEY="sk-ant-..."
+    3. Export your Gemini key:  export GEMINI_API_KEY="your-key-here"
     4. Run:  python ai_tools_extractor.py
 """
 
@@ -27,7 +27,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from anthropic import Anthropic
+import google.generativeai as genai
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 import config
@@ -377,12 +377,10 @@ def _chunk_text(text: str, max_chars: int) -> list[str]:
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
 def _llm_extract_tools(text_chunk: str) -> str:
     """Ask the LLM to list AI tools mentioned in a text chunk."""
-    client = Anthropic()
-    response = client.messages.create(
-        model=config.LLM_MODEL,
-        max_tokens=config.LLM_MAX_TOKENS,
-        temperature=0.2,
-        system=textwrap.dedent("""\
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    model = genai.GenerativeModel(
+        model_name=config.LLM_MODEL,
+        system_instruction=textwrap.dedent("""\
             You are an AI-tools analyst. Given newsletter content, extract
             every AI tool mentioned. For each tool output:
             - Tool Name
@@ -391,9 +389,13 @@ def _llm_extract_tools(text_chunk: str) -> str:
             - Source URL of the tool (if mentioned, else "N/A")
             Return the results as a JSON array of objects.
         """),
-        messages=[{"role": "user", "content": text_chunk}],
+        generation_config=genai.GenerationConfig(
+            max_output_tokens=config.LLM_MAX_TOKENS,
+            temperature=0.2,
+        ),
     )
-    return response.content[0].text
+    response = model.generate_content(text_chunk)
+    return response.text
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
@@ -445,16 +447,18 @@ def _llm_rank_and_categorise(mentions_text: str) -> dict:
         {mentions_text}
     """)
 
-    client = Anthropic()
-    response = client.messages.create(
-        model=config.LLM_MODEL,
-        max_tokens=config.LLM_MAX_TOKENS,
-        temperature=0.1,
-        system="Return only valid JSON. No markdown.",
-        messages=[{"role": "user", "content": prompt}],
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    model = genai.GenerativeModel(
+        model_name=config.LLM_MODEL,
+        system_instruction="Return only valid JSON. No markdown.",
+        generation_config=genai.GenerationConfig(
+            max_output_tokens=config.LLM_MAX_TOKENS,
+            temperature=0.1,
+        ),
     )
+    response = model.generate_content(prompt)
 
-    raw = response.content[0].text.strip()
+    raw = response.text.strip()
     # Strip markdown code fences if the model added them anyway
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
