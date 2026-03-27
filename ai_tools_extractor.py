@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import textwrap
+import time
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
@@ -370,6 +371,8 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
     for i, chunk in enumerate(chunks):
         log.info("LLM extraction pass %d/%d …", i + 1, len(chunks))
         raw_mentions.append(_llm_extract_tools(chunk))
+        if i < len(chunks) - 1:
+            time.sleep(10)  # avoid Gemini rate limits between chunks
 
     # Phase 2: aggregate, rank, and categorise
     combined_mentions = "\n\n".join(raw_mentions)
