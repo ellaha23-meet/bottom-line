@@ -20,6 +20,9 @@ import re
 import textwrap
 from datetime import datetime, timedelta, timezone
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as dateparser
