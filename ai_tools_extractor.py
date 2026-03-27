@@ -465,6 +465,13 @@ def _llm_rank_and_categorise(mentions_text: str) -> dict:
     # Strip markdown code fences if the model added them anyway
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
+    raw = raw.strip()
+
+    # If the model wrapped JSON in extra text, extract the outermost { ... }
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1:
+        raw = raw[start:end + 1]
 
     return json.loads(raw)
 
