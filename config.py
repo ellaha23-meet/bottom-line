@@ -17,7 +17,7 @@ ARCHIVE_URLS = [
 # ---------------------------------------------------------------------------
 # Gmail label to fetch newsletters from
 # ---------------------------------------------------------------------------
-GMAIL_LABEL = "AI-NewsLetters"
+GMAIL_LABEL = "AI-Newsletters"
 
 # ---------------------------------------------------------------------------
 # Google Sheets configuration
