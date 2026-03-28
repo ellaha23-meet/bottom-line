@@ -502,23 +502,11 @@ def _llm_rank_and_categorise(mentions_text: str) -> dict:
         generation_config=genai.GenerationConfig(
             max_output_tokens=config.LLM_MAX_TOKENS,
             temperature=0.1,
+            response_mime_type="application/json",
         ),
     )
     response = model.generate_content(prompt)
-
-    raw = response.text.strip()
-    # Strip markdown code fences if the model added them anyway
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    raw = raw.strip()
-
-    # If the model wrapped JSON in extra text, extract the outermost { ... }
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start != -1 and end != -1:
-        raw = raw[start:end + 1]
-
-    return json.loads(raw)
+    return json.loads(response.text)
 
 
 # ===================================================================
