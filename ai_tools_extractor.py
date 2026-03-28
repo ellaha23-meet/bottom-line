@@ -228,13 +228,28 @@ def scrape_archives() -> list[dict]:
 
 def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dict]:
     """Parse an archive page and fetch individual article content."""
-    html = _fetch_page(archive_url, page)
+    # Navigate to the archive page
+    try:
+        page.goto(archive_url, wait_until="networkidle", timeout=config.REQUEST_TIMEOUT * 1000)
+    except PlaywrightTimeoutError:
+        page.goto(archive_url, wait_until="domcontentloaded", timeout=config.REQUEST_TIMEOUT * 1000)
+
+    # Scroll down repeatedly to trigger infinite scroll and load all articles
+    prev_height = 0
+    for _ in range(30):  # up to 30 scrolls (~30 days of articles)
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(2000)  # wait 2s for new content to load
+        new_height = page.evaluate("document.body.scrollHeight")
+        if new_height == prev_height:
+            break  # no more content loading
+        prev_height = new_height
+
+    html = page.content()
     soup = BeautifulSoup(html, "html.parser")
     articles: list[dict] = []
 
-    # Most Substack / Beehiiv archives use <a> with a date nearby.
-    # We look for common patterns: post links inside archive list items.
     link_candidates = _find_article_links(soup, archive_url)
+    log.info("  -> found %d link candidates on archive page", len(link_candidates))
 
     for title, url, date_str in link_candidates[: config.MAX_ARTICLES_PER_SOURCE]:
         pub_date = _parse_date_safe(date_str)
