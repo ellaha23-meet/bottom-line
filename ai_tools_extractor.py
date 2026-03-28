@@ -178,11 +178,7 @@ def _extract_email_body(payload: dict) -> str:
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def _fetch_page(url: str, page) -> str:
     """Navigate to a URL with Playwright and return the fully-rendered HTML."""
-    try:
-        page.goto(url, wait_until="networkidle", timeout=config.REQUEST_TIMEOUT * 1000)
-    except PlaywrightTimeoutError:
-        # networkidle can be slow on JS-heavy pages; fall back to domcontentloaded
-        page.goto(url, wait_until="domcontentloaded", timeout=config.REQUEST_TIMEOUT * 1000)
+    page.goto(url, wait_until="domcontentloaded", timeout=15_000)
     return page.content()
 
 
