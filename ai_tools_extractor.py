@@ -245,11 +245,20 @@ def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dic
         prev_height = new_height
 
     html = page.content()
+
+    # Save rendered HTML for debugging (first archive only)
+    debug_file = f"debug_{archive_url.split('/')[2]}.html"
+    with open(debug_file, "w", encoding="utf-8") as f:
+        f.write(html)
+    log.info("  -> saved rendered HTML to %s", debug_file)
+
     soup = BeautifulSoup(html, "html.parser")
     articles: list[dict] = []
 
     link_candidates = _find_article_links(soup, archive_url)
     log.info("  -> found %d link candidates on archive page", len(link_candidates))
+    for title, url, date_str in link_candidates[:5]:
+        log.info("     sample: [%s] %s (%s)", date_str, title[:60], url[:80])
 
     for title, url, date_str in link_candidates[: config.MAX_ARTICLES_PER_SOURCE]:
         pub_date = _parse_date_safe(date_str)
