@@ -56,6 +56,6 @@ LLM_MAX_TOKENS = 16384
 # ---------------------------------------------------------------------------
 # Scraping / time-window settings
 # ---------------------------------------------------------------------------
-LOOKBACK_DAYS = 14
+LOOKBACK_DAYS = 21
 REQUEST_TIMEOUT = 30  # seconds per HTTP request
 MAX_ARTICLES_PER_SOURCE = 200  # safety cap per archive
