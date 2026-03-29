@@ -502,7 +502,9 @@ def _llm_rank_and_categorise(mentions_text: str) -> dict:
         ),
     )
     response = model.generate_content(prompt)
-    return json.loads(response.text)
+    raw = response.text.strip()
+    log.info("Raw LLM response (first 500 chars): %s", raw[:500])
+    return json.loads(raw)
 
 
 # ===================================================================
