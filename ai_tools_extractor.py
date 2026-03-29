@@ -502,9 +502,7 @@ def _llm_rank_and_categorise(mentions_text: str) -> dict:
         ),
     )
     response = model.generate_content(prompt)
-    raw = response.text.strip()
-    log.info("Raw LLM response (first 500 chars): %s", raw[:500])
-    return json.loads(raw)
+    return json.loads(response.text)
 
 
 # ===================================================================
@@ -568,8 +566,8 @@ def write_to_sheets(creds: Credentials, data: dict) -> None:
 def _ensure_tab_exists(service, spreadsheet_id: str, tab_name: str) -> None:
     """Create the tab if it doesn't already exist in the spreadsheet."""
     meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    existing = [s["properties"]["title"] for s in meta.get("sheets", [])]
-    if tab_name not in existing:
+    existing = [s["properties"]["title"].strip() for s in meta.get("sheets", [])]
+    if tab_name.strip() not in existing:
         service.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={"requests": [{"addSheet": {"properties": {"title": tab_name}}}]},
