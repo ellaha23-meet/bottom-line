@@ -392,7 +392,7 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
         log.info("LLM extraction pass %d/%d …", i + 1, len(chunks))
         raw_mentions.append(_llm_extract_tools(chunk))
         if i < len(chunks) - 1:
-            time.sleep(60)  # avoid Gemini rate limits between chunks
+            time.sleep(15)  # 5 RPM limit: wait 15s between chunks
 
     # Phase 2: aggregate, rank, and categorise
     combined_mentions = "\n\n".join(raw_mentions)
