@@ -27,7 +27,7 @@ GMAIL_LABEL = "AI-Newsletters"
 SPREADSHEET_ID = ""  # <-- Paste your Sheet ID here
 
 TAB_AI_TOOLS_LOG = "AI Tools Log"
-TAB_FIELD_TOOLS = "Field Tools"
+TAB_FIELD_TOOLS = "field tools"
 
 # ---------------------------------------------------------------------------
 # Tool categories
