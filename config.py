@@ -51,7 +51,7 @@ CATEGORIES = [
 # LLM settings
 # ---------------------------------------------------------------------------
 LLM_MODEL = "gemini-2.5-flash"
-LLM_MAX_TOKENS = 16384
+LLM_MAX_TOKENS = 32768
 
 # ---------------------------------------------------------------------------
 # Scraping / time-window settings

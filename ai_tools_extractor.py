@@ -397,6 +397,7 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
     # Phase 2: aggregate, rank, and categorise
     combined_mentions = "\n\n".join(raw_mentions)
     log.info("LLM ranking & categorisation pass …")
+    time.sleep(15)  # wait before ranking call to respect rate limit
     final_json = _llm_rank_and_categorise(combined_mentions)
 
     return final_json
