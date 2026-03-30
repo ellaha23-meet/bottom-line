@@ -33,6 +33,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 import google.generativeai as genai
+import requests as http_requests
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 import config
@@ -591,7 +592,110 @@ def _llm_rank_and_categorise(mentions_text: str) -> dict:
     time.sleep(15)
     log.info("LLM field_tools pass …")
     field_tools = _llm_field_tools(mentions_text)
-    return {"tools_log": tools_log, "field_tools": field_tools}
+
+    # Backfill missing URLs for both outputs
+    result = {"tools_log": tools_log, "field_tools": field_tools}
+    backfill_missing_urls(result)
+    return result
+
+
+# ===================================================================
+# 4b. URL Resolution for Missing Links
+# ===================================================================
+_URL_SUFFIXES = [".com", ".ai", ".io", ".dev", ".co", ".app", ".tools", ".org"]
+_RESOLVED_CACHE: dict[str, str] = {}  # tool_name -> resolved URL (or "N/A")
+
+
+def _normalise_name(tool_name: str) -> str:
+    """Lowercase, strip spaces/special chars to build candidate domain stems."""
+    return re.sub(r"[^a-z0-9]", "", tool_name.lower())
+
+
+def _try_url(url: str) -> bool:
+    """Return True if a HEAD (falling back to GET) request succeeds (2xx/3xx)."""
+    try:
+        resp = http_requests.head(
+            url, timeout=5, allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if resp.status_code < 400:
+            return True
+    except http_requests.RequestException:
+        pass
+    try:
+        resp = http_requests.get(
+            url, timeout=5, allow_redirects=True, stream=True,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        return resp.status_code < 400
+    except http_requests.RequestException:
+        return False
+
+
+def resolve_tool_url(tool_name: str) -> str:
+    """Try common domain patterns to find a tool's website.
+
+    Returns the first URL that responds with HTTP 2xx/3xx, or ``"N/A"``.
+    Results are cached so the same tool is never looked up twice.
+    """
+    if tool_name in _RESOLVED_CACHE:
+        return _RESOLVED_CACHE[tool_name]
+
+    stem = _normalise_name(tool_name)
+    if not stem:
+        _RESOLVED_CACHE[tool_name] = "N/A"
+        return "N/A"
+
+    for suffix in _URL_SUFFIXES:
+        candidate = f"https://{stem}{suffix}"
+        log.debug("  trying %s", candidate)
+        if _try_url(candidate):
+            log.info("  resolved '%s' -> %s", tool_name, candidate)
+            _RESOLVED_CACHE[tool_name] = candidate
+            return candidate
+
+    # Also try "www." prefix with .com
+    www = f"https://www.{stem}.com"
+    if _try_url(www):
+        log.info("  resolved '%s' -> %s", tool_name, www)
+        _RESOLVED_CACHE[tool_name] = www
+        return www
+
+    log.debug("  could not resolve URL for '%s'", tool_name)
+    _RESOLVED_CACHE[tool_name] = "N/A"
+    return "N/A"
+
+
+def _is_missing(url: str | None) -> bool:
+    """Return True if the URL is empty, N/A, or clearly not a real link."""
+    if not url:
+        return True
+    return url.strip().lower() in ("n/a", "na", "none", "")
+
+
+def backfill_missing_urls(data: dict) -> None:
+    """Fill in missing URLs in tools_log and field_tools via domain probing."""
+    missing_count = 0
+    filled_count = 0
+
+    for tool in data.get("tools_log", []):
+        if _is_missing(tool.get("source_link")):
+            missing_count += 1
+            resolved = resolve_tool_url(tool.get("tool_name", ""))
+            tool["source_link"] = resolved
+            if resolved != "N/A":
+                filled_count += 1
+
+    for entry in data.get("field_tools", []):
+        if _is_missing(entry.get("url")):
+            missing_count += 1
+            resolved = resolve_tool_url(entry.get("tool_name", ""))
+            entry["url"] = resolved
+            if resolved != "N/A":
+                filled_count += 1
+
+    log.info("URL backfill: %d missing, %d resolved, %d still N/A.",
+             missing_count, filled_count, missing_count - filled_count)
 
 
 # ===================================================================
