@@ -405,8 +405,10 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
     # Phase 2: aggregate, rank, and categorise
     # Programmatically count how many chunks each tool appeared in so Phase 2
     # receives real mention counts instead of guessing from deduplicated text.
-    mention_counts: dict[str, int] = Counter()
-    mention_meta: dict[str, dict] = {}  # tool_name -> latest metadata
+    # Count distinct source articles per tool using the "mentioned_in" attribution
+    # from Phase 1 — this gives real per-source counts, not per-chunk counts.
+    source_sets: dict[str, set] = {}   # tool_key -> set of source titles
+    mention_meta: dict[str, dict] = {}  # tool_key -> latest metadata
 
     for chunk_text in raw_mentions:
         # Strip markdown fences in case the model wrapped the JSON
@@ -419,20 +421,29 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
         except (json.JSONDecodeError, ValueError):
             entries = []
 
-        seen_in_chunk: set[str] = set()
         for entry in entries:
             name = (entry.get("tool_name") or entry.get("name") or "").strip()
             if not name:
                 continue
-            # Normalise name to lower-case for counting; keep original case
             key = name.lower()
-            if key not in seen_in_chunk:
-                mention_counts[key] += 1
-                seen_in_chunk.add(key)
+
+            # Accumulate distinct source articles for accurate mention counting
+            sources = entry.get("mentioned_in", [])
+            if isinstance(sources, str):
+                sources = [sources]
+            if key not in source_sets:
+                source_sets[key] = set()
+            source_sets[key].update(s for s in sources if s)
+
             # Keep metadata (prefer positive sentiment entries)
             if key not in mention_meta or entry.get("sentiment") == "positive":
                 mention_meta[key] = entry
                 mention_meta[key]["tool_name"] = name  # preserve original case
+
+    mention_counts: dict[str, int] = {
+        key: max(len(sources), 1)  # at least 1 if the tool was extracted at all
+        for key, sources in source_sets.items()
+    }
 
     # Build a frequency-annotated summary for Phase 2
     source_lines: list[str] = []
@@ -493,12 +504,14 @@ def _llm_extract_tools(text_chunk: str) -> str:
             EVERY AI tool, product, platform, or service mentioned — even
             those mentioned only in passing, in lists, in sponsorship
             sections, or in image captions. Be EXHAUSTIVE; do NOT skip any.
-            For each tool output:
-            - Tool Name
-            - Sentiment (positive / neutral / negative)
-            - Short description (1 sentence)
-            - Source URL of the tool (if mentioned, else "N/A")
-            Return the results as a JSON array of objects.
+            Each article begins with "Title: <title>". Use that title to
+            record which articles mentioned each tool.
+            Return a JSON array where each object has:
+            - "tool_name": name of the tool
+            - "sentiment": "positive", "neutral", or "negative"
+            - "description": 1-sentence description
+            - "source_url": tool's own website URL if mentioned, else "N/A"
+            - "mentioned_in": list of article/email titles that mentioned this tool
         """),
         generation_config=genai.GenerationConfig(
             max_output_tokens=config.LLM_MAX_TOKENS,
@@ -783,10 +796,10 @@ def write_to_sheets(creds: Credentials, data: dict) -> None:
         ])
 
     if rows_log:
-        _overwrite_rows(service, spreadsheet_id, config.TAB_AI_TOOLS_LOG,
-                        ["Date Logged", "Tool Name", "Category", "Mentions", "Description", "Source Link"],
-                        rows_log)
-        log.info("Wrote %d rows to '%s'.", len(rows_log), config.TAB_AI_TOOLS_LOG)
+        _append_rows(service, spreadsheet_id, config.TAB_AI_TOOLS_LOG,
+                     ["Date Logged", "Tool Name", "Category", "Mentions", "Description", "Source Link"],
+                     rows_log)
+        log.info("Appended %d rows to '%s'.", len(rows_log), config.TAB_AI_TOOLS_LOG)
 
     # --- Tab 2: Field Tools ---
     _ensure_tab_exists(service, spreadsheet_id, config.TAB_FIELD_TOOLS)
@@ -802,10 +815,10 @@ def write_to_sheets(creds: Credentials, data: dict) -> None:
         ])
 
     if rows_field:
-        _overwrite_rows(service, spreadsheet_id, config.TAB_FIELD_TOOLS,
-                        ["Field/Action", "Rank", "Tool Name", "Why it's Recommended", "URL"],
-                        rows_field)
-        log.info("Wrote %d rows to '%s'.", len(rows_field), config.TAB_FIELD_TOOLS)
+        _append_rows(service, spreadsheet_id, config.TAB_FIELD_TOOLS,
+                     ["Field/Action", "Rank", "Tool Name", "Why it's Recommended", "URL"],
+                     rows_field)
+        log.info("Appended %d rows to '%s'.", len(rows_field), config.TAB_FIELD_TOOLS)
 
 
 def _ensure_tab_exists(service, spreadsheet_id: str, tab_name: str) -> None:
@@ -837,17 +850,15 @@ def _ensure_headers(service, spreadsheet_id: str, tab_name: str, headers: list[s
         ).execute()
 
 
-def _overwrite_rows(service, spreadsheet_id: str, tab_name: str, headers: list[str], rows: list[list]) -> None:
-    """Clear the tab and write headers + rows from scratch."""
-    service.spreadsheets().values().clear(
-        spreadsheetId=spreadsheet_id,
-        range=f"'{tab_name}'!A:Z",
-    ).execute()
-    service.spreadsheets().values().update(
+def _append_rows(service, spreadsheet_id: str, tab_name: str, headers: list[str], rows: list[list]) -> None:
+    """Write headers if the tab is empty, then append rows below existing data."""
+    _ensure_headers(service, spreadsheet_id, tab_name, headers)
+    service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
         range=f"'{tab_name}'!A1",
         valueInputOption="USER_ENTERED",
-        body={"values": [headers] + rows},
+        insertDataOption="INSERT_ROWS",
+        body={"values": rows},
     ).execute()
 
 

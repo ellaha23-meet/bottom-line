@@ -27,7 +27,7 @@ GMAIL_LABEL = "AI-Newsletters"
 SPREADSHEET_ID = ""  # <-- Paste your Sheet ID here
 
 TAB_AI_TOOLS_LOG = "AI Tools Log"
-TAB_FIELD_TOOLS = "field tools"
+TAB_FIELD_TOOLS = "Field Tools"
 
 # ---------------------------------------------------------------------------
 # Tool categories
@@ -56,7 +56,7 @@ LLM_MAX_TOKENS = 32768
 # ---------------------------------------------------------------------------
 # Scraping / time-window settings
 # ---------------------------------------------------------------------------
-LOOKBACK_DAYS = 21
+LOOKBACK_DAYS = 14
 REQUEST_TIMEOUT = 30  # seconds per HTTP request
 MAX_ARTICLES_PER_SOURCE = 200  # safety cap per archive
 MAX_ARTICLE_CHARS = 15_000     # max chars to keep per article (≈3 000 words)
