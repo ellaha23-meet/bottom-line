@@ -503,7 +503,10 @@ def _llm_rank_and_categorise(mentions_text: str) -> dict:
         ),
     )
     response = model.generate_content(prompt)
-    return json.loads(response.text)
+    raw = response.text.strip()
+    log.info("Ranking response length: %d chars", len(raw))
+    log.info("Ranking response around error (chars 5000-5300): %s", raw[5000:5300] if len(raw) > 5000 else raw)
+    return json.loads(raw)
 
 
 # ===================================================================
