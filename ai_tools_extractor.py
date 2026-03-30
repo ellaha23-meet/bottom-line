@@ -403,8 +403,38 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
             time.sleep(15)  # 5 RPM limit: wait 15s between chunks
 
     # Phase 2: aggregate, rank, and categorise
-    # Build a source summary so Phase 2 has broader context than just
-    # Phase 1's extractions (mitigates tools missed by Phase 1).
+    # Programmatically count how many chunks each tool appeared in so Phase 2
+    # receives real mention counts instead of guessing from deduplicated text.
+    mention_counts: dict[str, int] = Counter()
+    mention_meta: dict[str, dict] = {}  # tool_name -> latest metadata
+
+    for chunk_text in raw_mentions:
+        # Strip markdown fences in case the model wrapped the JSON
+        clean = re.sub(r"^```(?:json)?\s*\n?", "", chunk_text.strip())
+        clean = re.sub(r"\n?```\s*$", "", clean.strip())
+        try:
+            entries = json.loads(clean)
+            if not isinstance(entries, list):
+                entries = []
+        except (json.JSONDecodeError, ValueError):
+            entries = []
+
+        seen_in_chunk: set[str] = set()
+        for entry in entries:
+            name = (entry.get("tool_name") or entry.get("name") or "").strip()
+            if not name:
+                continue
+            # Normalise name to lower-case for counting; keep original case
+            key = name.lower()
+            if key not in seen_in_chunk:
+                mention_counts[key] += 1
+                seen_in_chunk.add(key)
+            # Keep metadata (prefer positive sentiment entries)
+            if key not in mention_meta or entry.get("sentiment") == "positive":
+                mention_meta[key] = entry
+                mention_meta[key]["tool_name"] = name  # preserve original case
+
+    # Build a frequency-annotated summary for Phase 2
     source_lines: list[str] = []
     for art in articles:
         source_lines.append(f"- {art['title']}  ({art['source']})")
@@ -416,7 +446,19 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
         + "\n\n"
     )
 
-    combined_mentions = source_summary + "\n\n".join(raw_mentions)
+    counted_tools = sorted(mention_meta.values(),
+                           key=lambda e: mention_counts[e["tool_name"].lower()],
+                           reverse=True)
+    for entry in counted_tools:
+        entry["mentions"] = mention_counts[entry["tool_name"].lower()]
+
+    counted_summary = (
+        "TOOL MENTION COUNTS (programmatically counted across all sources):\n"
+        + json.dumps(counted_tools, indent=2)
+        + "\n\n"
+    )
+
+    combined_mentions = source_summary + counted_summary + "\n\n".join(raw_mentions)
     log.info("LLM ranking & categorisation pass …")
     time.sleep(15)  # wait before ranking call to respect rate limit
     final_json = _llm_rank_and_categorise(combined_mentions)
@@ -461,6 +503,7 @@ def _llm_extract_tools(text_chunk: str) -> str:
         generation_config=genai.GenerationConfig(
             max_output_tokens=config.LLM_MAX_TOKENS,
             temperature=0.2,
+            response_mime_type="application/json",
         ),
     )
     response = model.generate_content(text_chunk)
@@ -472,7 +515,9 @@ def _llm_tools_log(mentions_text: str) -> list:
     """Ask the LLM for the top 25 tools ranked by mentions."""
     prompt = textwrap.dedent(f"""\
         Below are AI tool mentions extracted from multiple newsletter sources.
-        Return a JSON array of EXACTLY 25 tools sorted by positive mentions (descending).
+        The "TOOL MENTION COUNTS" section contains pre-counted mention frequencies
+        — use those counts directly for the "mentions" field; do NOT guess or recalculate.
+        Return a JSON array of EXACTLY 25 tools sorted by mentions (descending).
         You MUST return exactly 25 entries — no more, no fewer.
 
         OUTPUT FORMAT (valid JSON array only, no markdown):
@@ -487,7 +532,7 @@ def _llm_tools_log(mentions_text: str) -> list:
         ]
 
         RULES:
-        - "mentions" = count of positive mentions across all sources.
+        - "mentions" = use the pre-counted value from TOOL MENTION COUNTS exactly.
         - "source_link" = the tool's own website, not the newsletter.
         - "description" = 1 sentence max.
 
