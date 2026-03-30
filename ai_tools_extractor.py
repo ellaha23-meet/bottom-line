@@ -796,10 +796,10 @@ def write_to_sheets(creds: Credentials, data: dict) -> None:
         ])
 
     if rows_log:
-        _append_rows(service, spreadsheet_id, config.TAB_AI_TOOLS_LOG,
-                     ["Date Logged", "Tool Name", "Category", "Mentions", "Description", "Source Link"],
-                     rows_log)
-        log.info("Appended %d rows to '%s'.", len(rows_log), config.TAB_AI_TOOLS_LOG)
+        _overwrite_rows(service, spreadsheet_id, config.TAB_AI_TOOLS_LOG,
+                        ["Date Logged", "Tool Name", "Category", "Mentions", "Description", "Source Link"],
+                        rows_log)
+        log.info("Wrote %d rows to '%s'.", len(rows_log), config.TAB_AI_TOOLS_LOG)
 
     # --- Tab 2: Field Tools ---
     _ensure_tab_exists(service, spreadsheet_id, config.TAB_FIELD_TOOLS)
@@ -815,10 +815,10 @@ def write_to_sheets(creds: Credentials, data: dict) -> None:
         ])
 
     if rows_field:
-        _append_rows(service, spreadsheet_id, config.TAB_FIELD_TOOLS,
-                     ["Field/Action", "Rank", "Tool Name", "Why it's Recommended", "URL"],
-                     rows_field)
-        log.info("Appended %d rows to '%s'.", len(rows_field), config.TAB_FIELD_TOOLS)
+        _overwrite_rows(service, spreadsheet_id, config.TAB_FIELD_TOOLS,
+                        ["Field/Action", "Rank", "Tool Name", "Why it's Recommended", "URL"],
+                        rows_field)
+        log.info("Wrote %d rows to '%s'.", len(rows_field), config.TAB_FIELD_TOOLS)
 
 
 def _ensure_tab_exists(service, spreadsheet_id: str, tab_name: str) -> None:
@@ -850,15 +850,17 @@ def _ensure_headers(service, spreadsheet_id: str, tab_name: str, headers: list[s
         ).execute()
 
 
-def _append_rows(service, spreadsheet_id: str, tab_name: str, headers: list[str], rows: list[list]) -> None:
-    """Write headers if the tab is empty, then append rows below existing data."""
-    _ensure_headers(service, spreadsheet_id, tab_name, headers)
-    service.spreadsheets().values().append(
+def _overwrite_rows(service, spreadsheet_id: str, tab_name: str, headers: list[str], rows: list[list]) -> None:
+    """Clear the tab and write headers + rows from scratch."""
+    service.spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{tab_name}'!A:Z",
+    ).execute()
+    service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
         range=f"'{tab_name}'!A1",
         valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
-        body={"values": rows},
+        body={"values": [headers] + rows},
     ).execute()
 
 
