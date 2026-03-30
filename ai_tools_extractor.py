@@ -396,13 +396,7 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
 
     # Phase 2: aggregate, rank, and categorise
     combined_mentions = "\n\n".join(raw_mentions)
-    if len(combined_mentions) > config.LLM_MAX_MENTIONS_CHARS:
-        log.warning(
-            "combined_mentions truncated from %d to %d chars to leave room for full output",
-            len(combined_mentions),
-            config.LLM_MAX_MENTIONS_CHARS,
-        )
-        combined_mentions = combined_mentions[: config.LLM_MAX_MENTIONS_CHARS]
+    log.info("combined_mentions size: %d chars (~%d tokens)", len(combined_mentions), len(combined_mentions) // 4)
     log.info("LLM ranking & categorisation pass …")
     time.sleep(15)  # wait before ranking call to respect rate limit
     final_json = _llm_rank_and_categorise(combined_mentions)
@@ -473,11 +467,11 @@ def _parse_llm_json(response) -> list:
         log.warning("Repaired truncated JSON array: recovered %d items", len(result))
 
     if truncated:
-        # Raise so the @retry decorator tries again; the input cap in
-        # analyze_content means a fresh attempt may produce complete output.
-        raise ValueError(
-            f"LLM output was cut off (finish_reason={finish_reason}); "
-            f"recovered {len(result)} items — retrying"
+        log.warning(
+            "LLM output was cut off (finish_reason=%s); got %d items. "
+            "Check combined_mentions size and max_output_tokens in config.",
+            finish_reason,
+            len(result),
         )
     return result
 

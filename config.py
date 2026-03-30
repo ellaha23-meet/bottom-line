@@ -52,9 +52,6 @@ CATEGORIES = [
 # ---------------------------------------------------------------------------
 LLM_MODEL = "gemini-2.5-flash"
 LLM_MAX_TOKENS = 32768
-# Max chars of extracted mentions fed to the ranking pass.
-# Keeps the input small enough that the model has room to produce complete output.
-LLM_MAX_MENTIONS_CHARS = 100_000
 
 # ---------------------------------------------------------------------------
 # Scraping / time-window settings
