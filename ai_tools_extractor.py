@@ -396,6 +396,13 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
 
     # Phase 2: aggregate, rank, and categorise
     combined_mentions = "\n\n".join(raw_mentions)
+    if len(combined_mentions) > config.LLM_MAX_MENTIONS_CHARS:
+        log.warning(
+            "combined_mentions truncated from %d to %d chars to leave room for full output",
+            len(combined_mentions),
+            config.LLM_MAX_MENTIONS_CHARS,
+        )
+        combined_mentions = combined_mentions[: config.LLM_MAX_MENTIONS_CHARS]
     log.info("LLM ranking & categorisation pass …")
     time.sleep(15)  # wait before ranking call to respect rate limit
     final_json = _llm_rank_and_categorise(combined_mentions)
@@ -448,21 +455,31 @@ def _parse_llm_json(response) -> list:
     candidate = response.candidates[0] if response.candidates else None
     finish_reason = candidate.finish_reason if candidate else None
     # finish_reason value 2 == MAX_TOKENS in the google-generativeai SDK
-    if finish_reason is not None and getattr(finish_reason, "value", finish_reason) not in (1, "STOP"):
-        log.warning("LLM response finish_reason=%s — output may be truncated", finish_reason)
+    finish_value = getattr(finish_reason, "value", finish_reason)
+    truncated = finish_value not in (1, "STOP", None)
+    if truncated:
+        log.warning("LLM response finish_reason=%s — output was truncated", finish_reason)
 
     text = response.text
     try:
-        return json.loads(text)
+        result = json.loads(text)
     except json.JSONDecodeError as exc:
         log.warning("JSON parse failed (%s), attempting repair of truncated array", exc)
         last_brace = text.rfind("}")
-        if last_brace != -1:
-            repaired = text[: last_brace + 1] + "\n]"
-            result = json.loads(repaired)  # raises if still invalid → triggers retry
-            log.warning("Repaired truncated JSON array: recovered %d items", len(result))
-            return result
-        raise
+        if last_brace == -1:
+            raise
+        repaired = text[: last_brace + 1] + "\n]"
+        result = json.loads(repaired)  # raises if still invalid → triggers retry
+        log.warning("Repaired truncated JSON array: recovered %d items", len(result))
+
+    if truncated:
+        # Raise so the @retry decorator tries again; the input cap in
+        # analyze_content means a fresh attempt may produce complete output.
+        raise ValueError(
+            f"LLM output was cut off (finish_reason={finish_reason}); "
+            f"recovered {len(result)} items — retrying"
+        )
+    return result
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
