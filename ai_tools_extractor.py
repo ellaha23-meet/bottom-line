@@ -383,8 +383,8 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
             f"Content:\n{email['body'][:6000]}\n{'---'}\n"
         )
 
-    # Split into manageable chunks for the LLM (≈120 000 chars ≈ 30k tokens)
-    chunks = _chunk_text("\n".join(digest_parts), max_chars=120_000)
+    # Split into chunks for the LLM (≈800 000 chars ≈ 200k tokens, fits in 1-2 chunks)
+    chunks = _chunk_text("\n".join(digest_parts), max_chars=800_000)
 
     # Phase 1: extract raw tool mentions from each chunk
     raw_mentions: list[str] = []
