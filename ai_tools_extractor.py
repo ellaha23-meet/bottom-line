@@ -444,47 +444,27 @@ def _llm_extract_tools(text_chunk: str) -> str:
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
-def _llm_rank_and_categorise(mentions_text: str) -> dict:
-    """Ask the LLM to rank and categorise tools, returning structured JSON."""
-    categories_str = "\n".join(f"- {c}" for c in config.CATEGORIES)
-
+def _llm_tools_log(mentions_text: str) -> list:
+    """Ask the LLM for the top 25 tools ranked by mentions."""
     prompt = textwrap.dedent(f"""\
         Below are AI tool mentions extracted from multiple newsletter sources.
-        Aggregate them, count positive mentions, and produce TWO JSON objects.
+        Return a JSON array of the top 25 tools sorted by positive mentions (descending).
 
-        CATEGORIES:
-        {categories_str}
-
-        OUTPUT FORMAT (return valid JSON only — no markdown fences):
-        {{
-          "tools_log": [
-            {{
-              "tool_name": "...",
-              "category": "...",
-              "mentions": <int>,
-              "description": "...",
-              "source_link": "https://..."
-            }}
-          ],
-          "field_tools": [
-            {{
-              "field": "<category name>",
-              "rank": <1-5>,
-              "tool_name": "...",
-              "why_recommended": "...",
-              "url": "https://..."
-            }}
-          ]
-        }}
+        OUTPUT FORMAT (valid JSON array only, no markdown):
+        [
+          {{
+            "tool_name": "...",
+            "category": "...",
+            "mentions": <int>,
+            "description": "1 sentence.",
+            "source_link": "https://..."
+          }}
+        ]
 
         RULES:
-        1. "tools_log" — top 15 tools max, sorted by positive mentions (descending).
-        2. "field_tools" — for EACH of the 12 categories, pick the top 3 tools,
-           ranked 1-3 (1 = best). If fewer than 3 exist, include as many as possible.
-        3. "mentions" = count of *positive* mentions across all sources.
-        4. "source_link" / "url" = the tool's own website, not the newsletter.
-        5. "description" = 1 sentence max.
-        6. "why_recommended" = 1 sentence max.
+        - "mentions" = count of positive mentions across all sources.
+        - "source_link" = the tool's own website, not the newsletter.
+        - "description" = 1 sentence max.
 
         MENTIONS DATA:
         {mentions_text}
@@ -493,7 +473,7 @@ def _llm_rank_and_categorise(mentions_text: str) -> dict:
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
     model = genai.GenerativeModel(
         model_name=config.LLM_MODEL,
-        system_instruction="Return only valid JSON. No markdown.",
+        system_instruction="Return only a valid JSON array. No markdown.",
         generation_config=genai.GenerationConfig(
             max_output_tokens=config.LLM_MAX_TOKENS,
             temperature=0.1,
@@ -501,10 +481,65 @@ def _llm_rank_and_categorise(mentions_text: str) -> dict:
         ),
     )
     response = model.generate_content(prompt)
-    raw = response.text.strip()
-    log.info("Ranking response length: %d chars", len(raw))
-    log.info("Ranking response around error (chars 5000-5300): %s", raw[5000:5300] if len(raw) > 5000 else raw)
-    return json.loads(raw)
+    return json.loads(response.text)
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
+def _llm_field_tools(mentions_text: str) -> list:
+    """Ask the LLM for the top 5 tools per category."""
+    categories_str = "\n".join(f"- {c}" for c in config.CATEGORIES)
+
+    prompt = textwrap.dedent(f"""\
+        Below are AI tool mentions extracted from multiple newsletter sources.
+        For EACH of the 12 categories below, return the top 5 tools ranked 1-5.
+
+        CATEGORIES:
+        {categories_str}
+
+        OUTPUT FORMAT (valid JSON array only, no markdown):
+        [
+          {{
+            "field": "<category name>",
+            "rank": <1-5>,
+            "tool_name": "...",
+            "why_recommended": "1 sentence.",
+            "url": "https://..."
+          }}
+        ]
+
+        RULES:
+        - rank 1 = best in category.
+        - If fewer than 5 tools exist for a category, include as many as possible.
+        - "url" = the tool's own website.
+        - "why_recommended" = 1 sentence max.
+
+        MENTIONS DATA:
+        {mentions_text}
+    """)
+
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    model = genai.GenerativeModel(
+        model_name=config.LLM_MODEL,
+        system_instruction="Return only a valid JSON array. No markdown.",
+        generation_config=genai.GenerationConfig(
+            max_output_tokens=config.LLM_MAX_TOKENS,
+            temperature=0.1,
+            response_mime_type="application/json",
+        ),
+    )
+    response = model.generate_content(prompt)
+    return json.loads(response.text)
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
+def _llm_rank_and_categorise(mentions_text: str) -> dict:
+    """Run two separate LLM calls for tools_log and field_tools."""
+    log.info("LLM tools_log pass …")
+    tools_log = _llm_tools_log(mentions_text)
+    time.sleep(15)
+    log.info("LLM field_tools pass …")
+    field_tools = _llm_field_tools(mentions_text)
+    return {"tools_log": tools_log, "field_tools": field_tools}
 
 
 # ===================================================================
