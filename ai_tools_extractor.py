@@ -93,7 +93,7 @@ def fetch_emails(creds: Credentials) -> list[dict]:
     Returns a list of dicts: ``{"subject": ..., "date": ..., "body": ...}``.
     Only emails from the last ``config.LOOKBACK_DAYS`` days are returned.
     """
-    service = build("gmail", "v1", credentials=creds)
+    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
     cutoff = datetime.now(timezone.utc) - timedelta(days=config.LOOKBACK_DAYS)
 
     # Find the label ID for the configured label name
@@ -778,7 +778,7 @@ def write_to_sheets(creds: Credentials, data: dict) -> None:
             "SPREADSHEET_ID is not set. Set it in config.py or as an env var."
         )
 
-    service = build("sheets", "v4", credentials=creds)
+    service = build("sheets", "v4", credentials=creds, cache_discovery=False)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # --- Tab 1: AI Tools Log ---
