@@ -403,15 +403,10 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
             time.sleep(15)  # 5 RPM limit: wait 15s between chunks
 
     # Phase 2: aggregate, rank, and categorise
-    # Programmatically count how many chunks each tool appeared in so Phase 2
-    # receives real mention counts instead of guessing from deduplicated text.
-    # Count distinct source articles per tool using the "mentioned_in" attribution
-    # from Phase 1 — this gives real per-source counts, not per-chunk counts.
-    source_sets: dict[str, set] = {}   # tool_key -> set of source titles
-    mention_meta: dict[str, dict] = {}  # tool_key -> latest metadata
+    # Collect unique tool names and their overall sentiment from Phase 1 output.
+    mention_meta: dict[str, dict] = {}  # tool_key -> metadata (sentiment, description, etc.)
 
     for chunk_text in raw_mentions:
-        # Strip markdown fences in case the model wrapped the JSON
         clean = re.sub(r"^```(?:json)?\s*\n?", "", chunk_text.strip())
         clean = re.sub(r"\n?```\s*$", "", clean.strip())
         try:
@@ -426,26 +421,26 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
             if not name:
                 continue
             key = name.lower()
-
-            # Accumulate distinct source articles for accurate mention counting
-            sources = entry.get("mentioned_in", [])
-            if isinstance(sources, str):
-                sources = [sources]
-            if key not in source_sets:
-                source_sets[key] = set()
-            source_sets[key].update(s for s in sources if s)
-
-            # Keep metadata (prefer positive sentiment entries)
+            # Keep metadata, preferring positive-sentiment entries
             if key not in mention_meta or entry.get("sentiment") == "positive":
                 mention_meta[key] = entry
                 mention_meta[key]["tool_name"] = name  # preserve original case
 
-    mention_counts: dict[str, int] = {
-        key: max(len(sources), 1)  # at least 1 if the tool was extracted at all
-        for key, sources in source_sets.items()
-    }
+    # Python string search across ALL raw article/email content — accurate and
+    # zero extra API calls. Count total mentions and positive-only mentions
+    # separately (requirement: rank by positive mentions).
+    log.info("Counting tool mentions via string search across %d articles and %d emails …",
+             len(articles), len(emails))
+    for key, meta in mention_meta.items():
+        tool_name = meta["tool_name"]
+        total = _count_tool_in_sources(tool_name, articles, emails)
+        # Positive mentions = sources where the tool appears AND Phase 1 flagged positive sentiment
+        positive = total if meta.get("sentiment") == "positive" else 0
+        meta["total_mentions"] = max(total, 1)   # at least 1 — it was extracted
+        meta["positive_mentions"] = max(positive, 1) if meta.get("sentiment") == "positive" else 0
+        meta["mentions"] = meta["positive_mentions"]  # primary ranking key
 
-    # Build a frequency-annotated summary for Phase 2
+    # Build a frequency-annotated summary for Phase 2, sorted by positive mentions
     source_lines: list[str] = []
     for art in articles:
         source_lines.append(f"- {art['title']}  ({art['source']})")
@@ -457,14 +452,14 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
         + "\n\n"
     )
 
-    counted_tools = sorted(mention_meta.values(),
-                           key=lambda e: mention_counts[e["tool_name"].lower()],
-                           reverse=True)
-    for entry in counted_tools:
-        entry["mentions"] = mention_counts[entry["tool_name"].lower()]
+    counted_tools = sorted(
+        mention_meta.values(),
+        key=lambda e: (e["positive_mentions"], e["total_mentions"]),
+        reverse=True,
+    )
 
     counted_summary = (
-        "TOOL MENTION COUNTS (programmatically counted across all sources):\n"
+        "TOOL MENTION COUNTS (positive_mentions = ranking key; total_mentions = all sources):\n"
         + json.dumps(counted_tools, indent=2)
         + "\n\n"
     )
@@ -493,6 +488,36 @@ def _chunk_text(text: str, max_chars: int) -> list[str]:
     return chunks
 
 
+def _count_tool_in_sources(
+    tool_name: str,
+    articles: list[dict],
+    emails: list[dict],
+) -> int:
+    """Count how many source documents mention tool_name (case-insensitive).
+
+    Uses word-boundary matching so "Pal" does not match "Palestine".
+    Falls back to plain substring search for tool names that contain
+    non-word characters (e.g. "GPT-4o").
+    """
+    if not tool_name or len(tool_name) < 2:
+        return 0
+    try:
+        pattern = re.compile(r"\b" + re.escape(tool_name) + r"\b", re.IGNORECASE)
+    except re.error:
+        pattern = re.compile(re.escape(tool_name), re.IGNORECASE)
+
+    count = 0
+    for art in articles:
+        haystack = art.get("title", "") + "\n" + art.get("content", "")
+        if pattern.search(haystack):
+            count += 1
+    for email in emails:
+        haystack = email.get("subject", "") + "\n" + email.get("body", "")
+        if pattern.search(haystack):
+            count += 1
+    return count
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
 def _llm_extract_tools(text_chunk: str) -> str:
     """Ask the LLM to list AI tools mentioned in a text chunk."""
@@ -504,14 +529,11 @@ def _llm_extract_tools(text_chunk: str) -> str:
             EVERY AI tool, product, platform, or service mentioned — even
             those mentioned only in passing, in lists, in sponsorship
             sections, or in image captions. Be EXHAUSTIVE; do NOT skip any.
-            Each article begins with "Title: <title>". Use that title to
-            record which articles mentioned each tool.
             Return a JSON array where each object has:
             - "tool_name": name of the tool
             - "sentiment": "positive", "neutral", or "negative"
             - "description": 1-sentence description
             - "source_url": tool's own website URL if mentioned, else "N/A"
-            - "mentioned_in": list of article/email titles that mentioned this tool
         """),
         generation_config=genai.GenerationConfig(
             max_output_tokens=config.LLM_MAX_TOKENS,
@@ -528,10 +550,12 @@ def _llm_tools_log(mentions_text: str) -> list:
     """Ask the LLM for the top 25 tools ranked by mentions."""
     prompt = textwrap.dedent(f"""\
         Below are AI tool mentions extracted from multiple newsletter sources.
-        The "TOOL MENTION COUNTS" section contains pre-counted mention frequencies
-        — use those counts directly for the "mentions" field; do NOT guess or recalculate.
-        Return a JSON array of EXACTLY 25 tools sorted by mentions (descending).
-        You MUST return exactly 25 entries — no more, no fewer.
+        The "TOOL MENTION COUNTS" section has pre-counted fields:
+          - positive_mentions: how many sources mentioned this tool with positive sentiment
+          - total_mentions: how many sources mentioned it in total
+        Rank tools by positive_mentions (descending); break ties by total_mentions.
+        Use positive_mentions as the value for the "mentions" field.
+        Return a JSON array of EXACTLY 25 tools. You MUST return exactly 25 entries.
 
         OUTPUT FORMAT (valid JSON array only, no markdown):
         [
@@ -545,7 +569,7 @@ def _llm_tools_log(mentions_text: str) -> list:
         ]
 
         RULES:
-        - "mentions" = use the pre-counted value from TOOL MENTION COUNTS exactly.
+        - "mentions" = the positive_mentions value from TOOL MENTION COUNTS.
         - "source_link" = the tool's own website, not the newsletter.
         - "description" = 1 sentence max.
 
