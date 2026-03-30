@@ -33,7 +33,6 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 import google.generativeai as genai
-import requests as http_requests
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 import config
@@ -600,70 +599,8 @@ def _llm_rank_and_categorise(mentions_text: str) -> dict:
 
 
 # ===================================================================
-# 4b. URL Resolution for Missing Links
+# 4b. URL Resolution for Missing Links (Grounded Google Search)
 # ===================================================================
-_URL_SUFFIXES = [".com", ".ai", ".io", ".dev", ".co", ".app", ".tools", ".org"]
-_RESOLVED_CACHE: dict[str, str] = {}  # tool_name -> resolved URL (or "N/A")
-
-
-def _normalise_name(tool_name: str) -> str:
-    """Lowercase, strip spaces/special chars to build candidate domain stems."""
-    return re.sub(r"[^a-z0-9]", "", tool_name.lower())
-
-
-def _try_url(url: str) -> bool:
-    """Return True if a HEAD (falling back to GET) request succeeds (2xx/3xx)."""
-    try:
-        resp = http_requests.head(
-            url, timeout=5, allow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        if resp.status_code < 400:
-            return True
-    except http_requests.RequestException:
-        pass
-    try:
-        resp = http_requests.get(
-            url, timeout=5, allow_redirects=True, stream=True,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        return resp.status_code < 400
-    except http_requests.RequestException:
-        return False
-
-
-def resolve_tool_url(tool_name: str) -> str:
-    """Try common domain patterns to find a tool's website.
-
-    Returns the first URL that responds with HTTP 2xx/3xx, or ``"N/A"``.
-    Results are cached so the same tool is never looked up twice.
-    """
-    if tool_name in _RESOLVED_CACHE:
-        return _RESOLVED_CACHE[tool_name]
-
-    stem = _normalise_name(tool_name)
-    if not stem:
-        _RESOLVED_CACHE[tool_name] = "N/A"
-        return "N/A"
-
-    for suffix in _URL_SUFFIXES:
-        candidate = f"https://{stem}{suffix}"
-        log.debug("  trying %s", candidate)
-        if _try_url(candidate):
-            log.info("  resolved '%s' -> %s", tool_name, candidate)
-            _RESOLVED_CACHE[tool_name] = candidate
-            return candidate
-
-    # Also try "www." prefix with .com
-    www = f"https://www.{stem}.com"
-    if _try_url(www):
-        log.info("  resolved '%s' -> %s", tool_name, www)
-        _RESOLVED_CACHE[tool_name] = www
-        return www
-
-    log.debug("  could not resolve URL for '%s'", tool_name)
-    _RESOLVED_CACHE[tool_name] = "N/A"
-    return "N/A"
 
 
 def _is_missing(url: str | None) -> bool:
@@ -673,29 +610,103 @@ def _is_missing(url: str | None) -> bool:
     return url.strip().lower() in ("n/a", "na", "none", "")
 
 
+@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=2, min=4, max=15))
+def _grounded_url_lookup(tool_names: list[str]) -> dict[str, str]:
+    """Use Gemini + Google Search grounding to find official tool URLs.
+
+    Makes a single grounded API call.  Grounding has its own quota
+    (500 req/day on the free tier) separate from the regular 250 RPD,
+    so this adds minimal pressure on rate limits.
+    Returns ``{tool_name: url_or_"N/A"}``.
+    """
+    tools_list = "\n".join(f"- {name}" for name in tool_names)
+    prompt = textwrap.dedent(f"""\
+        For each AI tool listed below, use Google Search to find its
+        official website URL.  Return ONLY a valid JSON object mapping
+        each tool name (exactly as written below) to its official URL.
+        Use "N/A" if you truly cannot find an official website.
+
+        Tools:
+        {tools_list}
+    """)
+
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+
+    google_search_tool = genai.protos.Tool(
+        google_search=genai.protos.GoogleSearch()
+    )
+
+    model = genai.GenerativeModel(
+        model_name=config.LLM_MODEL,
+        generation_config=genai.GenerationConfig(
+            temperature=0.1,
+            max_output_tokens=4096,
+        ),
+    )
+
+    response = model.generate_content(prompt, tools=[google_search_tool])
+    text = response.text
+
+    # Strip markdown code fences if the model wrapped the JSON
+    text = re.sub(r"^```(?:json)?\s*\n?", "", text.strip())
+    text = re.sub(r"\n?```\s*$", "", text.strip())
+
+    return json.loads(text)
+
+
 def backfill_missing_urls(data: dict) -> None:
-    """Fill in missing URLs in tools_log and field_tools via domain probing."""
-    missing_count = 0
-    filled_count = 0
+    """Collect tools with missing URLs and resolve them in one grounded call."""
+    # Gather unique tool names that need a URL
+    missing_tools: set[str] = set()
 
     for tool in data.get("tools_log", []):
         if _is_missing(tool.get("source_link")):
-            missing_count += 1
-            resolved = resolve_tool_url(tool.get("tool_name", ""))
-            tool["source_link"] = resolved
-            if resolved != "N/A":
-                filled_count += 1
+            name = tool.get("tool_name", "").strip()
+            if name:
+                missing_tools.add(name)
 
     for entry in data.get("field_tools", []):
         if _is_missing(entry.get("url")):
-            missing_count += 1
-            resolved = resolve_tool_url(entry.get("tool_name", ""))
-            entry["url"] = resolved
-            if resolved != "N/A":
-                filled_count += 1
+            name = entry.get("tool_name", "").strip()
+            if name:
+                missing_tools.add(name)
 
-    log.info("URL backfill: %d missing, %d resolved, %d still N/A.",
-             missing_count, filled_count, missing_count - filled_count)
+    if not missing_tools:
+        log.info("URL backfill: all tools already have URLs.")
+        return
+
+    log.info("URL backfill: looking up %d tools with missing URLs …",
+             len(missing_tools))
+
+    # Single grounded-search call for all missing tools
+    try:
+        time.sleep(15)  # respect rate limit before the API call
+        resolved = _grounded_url_lookup(sorted(missing_tools))
+    except Exception:
+        log.exception("Grounded URL lookup failed — URLs will remain N/A.")
+        resolved = {}
+
+    # Apply resolved URLs back into the data
+    filled = 0
+    for tool in data.get("tools_log", []):
+        if _is_missing(tool.get("source_link")):
+            name = tool.get("tool_name", "").strip()
+            url = resolved.get(name, "N/A")
+            tool["source_link"] = url
+            if not _is_missing(url):
+                filled += 1
+
+    for entry in data.get("field_tools", []):
+        if _is_missing(entry.get("url")):
+            name = entry.get("tool_name", "").strip()
+            url = resolved.get(name, "N/A")
+            entry["url"] = url
+            if not _is_missing(url):
+                filled += 1
+
+    log.info("URL backfill complete: %d/%d unique tools resolved.",
+             sum(1 for v in resolved.values() if not _is_missing(v)),
+             len(missing_tools))
 
 
 # ===================================================================
