@@ -443,6 +443,28 @@ def _llm_extract_tools(text_chunk: str) -> str:
     return response.text
 
 
+def _parse_llm_json(response) -> list:
+    """Parse a Gemini response as JSON, repairing truncated arrays if needed."""
+    candidate = response.candidates[0] if response.candidates else None
+    finish_reason = candidate.finish_reason if candidate else None
+    # finish_reason value 2 == MAX_TOKENS in the google-generativeai SDK
+    if finish_reason is not None and getattr(finish_reason, "value", finish_reason) not in (1, "STOP"):
+        log.warning("LLM response finish_reason=%s — output may be truncated", finish_reason)
+
+    text = response.text
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        log.warning("JSON parse failed (%s), attempting repair of truncated array", exc)
+        last_brace = text.rfind("}")
+        if last_brace != -1:
+            repaired = text[: last_brace + 1] + "\n]"
+            result = json.loads(repaired)  # raises if still invalid → triggers retry
+            log.warning("Repaired truncated JSON array: recovered %d items", len(result))
+            return result
+        raise
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
 def _llm_tools_log(mentions_text: str) -> list:
     """Ask the LLM for the top 25 tools ranked by mentions."""
@@ -481,7 +503,7 @@ def _llm_tools_log(mentions_text: str) -> list:
         ),
     )
     response = model.generate_content(prompt)
-    return json.loads(response.text)
+    return _parse_llm_json(response)
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
@@ -528,7 +550,7 @@ def _llm_field_tools(mentions_text: str) -> list:
         ),
     )
     response = model.generate_content(prompt)
-    return json.loads(response.text)
+    return _parse_llm_json(response)
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
