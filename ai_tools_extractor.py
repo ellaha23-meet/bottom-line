@@ -19,6 +19,7 @@ import os
 import re
 import textwrap
 import time
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
@@ -256,11 +257,18 @@ def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dic
     for title, url, date_str in link_candidates[:5]:
         log.info("     sample: [%s] %s (%s)", date_str, title[:60], url[:80])
 
-    for title, url, date_str in link_candidates[: config.MAX_ARTICLES_PER_SOURCE]:
-        pub_date = _parse_date_safe(date_str)
-        if pub_date and pub_date < cutoff:
-            continue  # older than 14 days — skip
+    # Filter by date FIRST, then apply the per-source cap so recent articles
+    # beyond position MAX_ARTICLES_PER_SOURCE are never silently dropped.
+    recent_candidates = []
+    for t, u, d in link_candidates:
+        pub = _parse_date_safe(d)
+        if pub and pub < cutoff:
+            continue  # older than lookback window — skip
+        recent_candidates.append((t, u, d))
+    log.info("  -> %d candidates after date filter (cutoff %s)",
+             len(recent_candidates), cutoff.strftime("%Y-%m-%d"))
 
+    for title, url, date_str in recent_candidates[: config.MAX_ARTICLES_PER_SOURCE]:
         try:
             page_html = _fetch_page(url, page)
             page_soup = BeautifulSoup(page_html, "html.parser")
@@ -280,7 +288,7 @@ def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dic
             "title": title,
             "date": date_str,
             "url": url,
-            "content": content[:8000],  # cap to avoid token explosion
+            "content": content[:config.MAX_ARTICLE_CHARS],
         })
 
     return articles
@@ -380,7 +388,7 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
         digest_parts.append(
             f"[Source: Gmail / {config.GMAIL_LABEL}]\n"
             f"Subject: {email['subject']}\nDate: {email['date']}\n"
-            f"Content:\n{email['body'][:6000]}\n{'---'}\n"
+            f"Content:\n{email['body'][:config.MAX_EMAIL_CHARS]}\n{'---'}\n"
         )
 
     # Split into chunks for the LLM (≈800 000 chars ≈ 200k tokens, fits in 1-2 chunks)
@@ -395,7 +403,20 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
             time.sleep(15)  # 5 RPM limit: wait 15s between chunks
 
     # Phase 2: aggregate, rank, and categorise
-    combined_mentions = "\n\n".join(raw_mentions)
+    # Build a source summary so Phase 2 has broader context than just
+    # Phase 1's extractions (mitigates tools missed by Phase 1).
+    source_lines: list[str] = []
+    for art in articles:
+        source_lines.append(f"- {art['title']}  ({art['source']})")
+    for email in emails:
+        source_lines.append(f"- Email: {email['subject']}")
+    source_summary = (
+        "SOURCES ANALYZED (article titles for context):\n"
+        + "\n".join(source_lines)
+        + "\n\n"
+    )
+
+    combined_mentions = source_summary + "\n\n".join(raw_mentions)
     log.info("LLM ranking & categorisation pass …")
     time.sleep(15)  # wait before ranking call to respect rate limit
     final_json = _llm_rank_and_categorise(combined_mentions)
@@ -427,7 +448,10 @@ def _llm_extract_tools(text_chunk: str) -> str:
         model_name=config.LLM_MODEL,
         system_instruction=textwrap.dedent("""\
             You are an AI-tools analyst. Given newsletter content, extract
-            every AI tool mentioned. For each tool output:
+            EVERY AI tool, product, platform, or service mentioned — even
+            those mentioned only in passing, in lists, in sponsorship
+            sections, or in image captions. Be EXHAUSTIVE; do NOT skip any.
+            For each tool output:
             - Tool Name
             - Sentiment (positive / neutral / negative)
             - Short description (1 sentence)
@@ -448,7 +472,8 @@ def _llm_tools_log(mentions_text: str) -> list:
     """Ask the LLM for the top 25 tools ranked by mentions."""
     prompt = textwrap.dedent(f"""\
         Below are AI tool mentions extracted from multiple newsletter sources.
-        Return a JSON array of the top 25 tools sorted by positive mentions (descending).
+        Return a JSON array of EXACTLY 25 tools sorted by positive mentions (descending).
+        You MUST return exactly 25 entries — no more, no fewer.
 
         OUTPUT FORMAT (valid JSON array only, no markdown):
         [
@@ -481,7 +506,16 @@ def _llm_tools_log(mentions_text: str) -> list:
         ),
     )
     response = model.generate_content(prompt)
-    return json.loads(response.text)
+    tools = json.loads(response.text)
+
+    # Validate: we asked for 25 tools — retry if the model returned far fewer
+    if len(tools) < 20:
+        log.warning("tools_log returned only %d tools (expected 25), retrying …", len(tools))
+        raise ValueError(f"tools_log too short: {len(tools)} tools (need ≥20)")
+    if len(tools) < 25:
+        log.warning("tools_log returned %d tools (expected 25) — accepting.", len(tools))
+
+    return tools
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
@@ -508,8 +542,8 @@ def _llm_field_tools(mentions_text: str) -> list:
         ]
 
         RULES:
+        - You MUST return EXACTLY 5 tools for EVERY category (60 entries total).
         - rank 1 = best in category.
-        - If fewer than 5 tools exist for a category, include as many as possible.
         - "url" = the tool's own website.
         - "why_recommended" = 1 sentence max.
 
@@ -528,10 +562,28 @@ def _llm_field_tools(mentions_text: str) -> list:
         ),
     )
     response = model.generate_content(prompt)
-    return json.loads(response.text)
+    entries = json.loads(response.text)
+
+    # Validate: every category should have 5 tools (≥4 to trigger retry)
+    field_counts = Counter(e.get("field", "") for e in entries)
+    missing_fields = [c for c in config.CATEGORIES if c not in field_counts]
+    short_fields = [c for c, n in field_counts.items() if n < 4]
+
+    if missing_fields:
+        log.warning("field_tools missing categories: %s — retrying …", missing_fields)
+        raise ValueError(f"field_tools missing categories: {missing_fields}")
+    if short_fields:
+        log.warning("field_tools has <4 tools for: %s — retrying …", short_fields)
+        raise ValueError(f"field_tools short categories: {short_fields}")
+
+    # Log any category with fewer than 5 (but ≥4) — accept without retry
+    for cat, count in field_counts.items():
+        if count < 5:
+            log.warning("field_tools: '%s' has only %d tools (expected 5) — accepting.", cat, count)
+
+    return entries
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
 def _llm_rank_and_categorise(mentions_text: str) -> dict:
     """Run two separate LLM calls for tools_log and field_tools."""
     log.info("LLM tools_log pass …")
