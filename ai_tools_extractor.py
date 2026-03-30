@@ -478,15 +478,13 @@ def _llm_rank_and_categorise(mentions_text: str) -> dict:
         }}
 
         RULES:
-        1. "tools_log" — list the overall top tools sorted by positive mentions
-           (descending). Include all tools with >=2 mentions.
-        2. "field_tools" — for EACH of the 12 categories, pick the top 5 tools,
-           ranked 1-5 (1 = best). If fewer than 5 exist, include as many as
-           possible.
+        1. "tools_log" — top 15 tools max, sorted by positive mentions (descending).
+        2. "field_tools" — for EACH of the 12 categories, pick the top 3 tools,
+           ranked 1-3 (1 = best). If fewer than 3 exist, include as many as possible.
         3. "mentions" = count of *positive* mentions across all sources.
         4. "source_link" / "url" = the tool's own website, not the newsletter.
-        5. "description" = 1-2 sentences.
-        6. "why_recommended" = brief synthesis of reviewer praise.
+        5. "description" = 1 sentence max.
+        6. "why_recommended" = 1 sentence max.
 
         MENTIONS DATA:
         {mentions_text}
