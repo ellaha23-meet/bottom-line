@@ -49,6 +49,7 @@ log = logging.getLogger(__name__)
 # Rate-limit helpers
 # ---------------------------------------------------------------------------
 _last_llm_call_time: float = 0.0   # timestamp of the most recent LLM call
+_last_llm_tokens: int = 0          # estimated tokens of the most recent call
 _llm_calls_today: int = 0          # simple counter for RPD awareness
 
 
@@ -60,31 +61,40 @@ def _estimate_tokens(text: str) -> int:
 def _rate_limit_wait(estimated_input_tokens: int) -> None:
     """Sleep enough to respect RPM and TPM limits before the next LLM call.
 
-    Strategy: after every request we must wait long enough so that the
-    tokens from this request have "left" the 1-minute rolling window.
-    We also enforce a minimum gap of ``60 / RPM_LIMIT`` seconds.
+    TPM is a **rolling 60-second window**: tokens from a previous request
+    don't "gradually leave" — they all clear at exactly 60 s after the
+    request was made.  Therefore, if prev_tokens + current_tokens > TPM
+    we must wait a full 60 s from the previous call so that the previous
+    tokens have left the window before the new ones enter.
+
+    If both requests fit within the TPM budget simultaneously, we only
+    need to enforce the RPM minimum spacing (60 / RPM_LIMIT seconds).
     """
-    global _last_llm_call_time, _llm_calls_today
+    global _last_llm_call_time, _last_llm_tokens, _llm_calls_today
 
-    estimated_total = estimated_input_tokens + config.LLM_MAX_TOKENS  # input + max output
-    # Seconds of TPM budget this request consumes
-    tpm_wait = (estimated_total / config.TPM_LIMIT) * 60
-    # Minimum gap for RPM
-    rpm_wait = 60 / config.RPM_LIMIT  # 6 s for RPM=10
+    current_tokens = estimated_input_tokens + config.LLM_MAX_TOKENS  # input + max output
 
-    required_gap = max(tpm_wait, rpm_wait)
+    # Determine required gap from the previous call
+    if _last_llm_tokens + current_tokens > config.TPM_LIMIT:
+        # Both requests cannot share a 60 s window — wait for the
+        # previous tokens to fully clear.
+        required_gap = 62  # 60 s + 2 s safety margin
+    else:
+        # Both fit within TPM simultaneously — just enforce RPM spacing.
+        required_gap = 60 / config.RPM_LIMIT  # 6 s for RPM=10
 
     now = time.time()
     elapsed = now - _last_llm_call_time if _last_llm_call_time else required_gap
     if elapsed < required_gap:
-        sleep_for = required_gap - elapsed + 1  # +1 s safety margin
+        sleep_for = required_gap - elapsed
         log.info(
-            "Rate-limit: sleeping %.1fs (est. %d tokens, TPM gap=%.1fs, RPM gap=%.1fs)",
-            sleep_for, estimated_total, tpm_wait, rpm_wait,
+            "Rate-limit: sleeping %.1fs (prev %d + curr %d tokens, gap %.0fs)",
+            sleep_for, _last_llm_tokens, current_tokens, required_gap,
         )
         time.sleep(sleep_for)
 
     _last_llm_call_time = time.time()
+    _last_llm_tokens = current_tokens
     _llm_calls_today += 1
     if _llm_calls_today > config.RPD_LIMIT * 0.8:
         log.warning("Approaching daily request limit: %d / %d RPD used.", _llm_calls_today, config.RPD_LIMIT)
@@ -446,7 +456,6 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
     raw_mentions: list[str] = []
     for i, chunk in enumerate(chunks):
         log.info("LLM extraction pass %d/%d (%d chars) …", i + 1, len(chunks), len(chunk))
-        _rate_limit_wait(_estimate_tokens(chunk))
         raw_mentions.append(_llm_extract_tools(chunk))
 
     # Phase 2: aggregate extracted mentions into a clean summary so the
@@ -488,7 +497,7 @@ def _aggregate_mentions(raw_mentions: list[str]) -> str:
     LLM receives a clean, complete picture of every tool found.  Falls back
     to raw concatenation if JSON parsing fails for all chunks.
     """
-    all_tools: dict[str, dict] = {}  # tool_name -> aggregated data
+    all_tools: dict[str, dict] = {}  # lowered tool name -> aggregated data
     unparsed_chunks: list[str] = []
 
     for raw in raw_mentions:
@@ -531,8 +540,12 @@ def _aggregate_mentions(raw_mentions: list[str]) -> str:
                 or "N/A"
             ).strip()
 
-            if name not in all_tools:
-                all_tools[name] = {
+            # Case-insensitive dedup: "ChatGPT" and "chatGPT" → same tool.
+            # Preserve the most common casing (first seen).
+            name_key = name.lower()
+            if name_key not in all_tools:
+                all_tools[name_key] = {
+                    "display_name": name,
                     "positive": 0,
                     "neutral": 0,
                     "negative": 0,
@@ -540,7 +553,7 @@ def _aggregate_mentions(raw_mentions: list[str]) -> str:
                     "urls": set(),
                 }
 
-            entry = all_tools[name]
+            entry = all_tools[name_key]
             if sentiment in ("positive", "neutral", "negative"):
                 entry[sentiment] += 1
             else:
@@ -558,7 +571,8 @@ def _aggregate_mentions(raw_mentions: list[str]) -> str:
             key=lambda x: x[1]["positive"],
             reverse=True,
         )
-        for name, data in sorted_tools:
+        for _key, data in sorted_tools:
+            name = data["display_name"]
             total = data["positive"] + data["neutral"] + data["negative"]
             desc = data["descriptions"][0] if data["descriptions"] else ""
             urls = ", ".join(sorted(data["urls"])) if data["urls"] else "N/A"
@@ -584,7 +598,11 @@ def _llm_extract_tools(text_chunk: str) -> str:
 
     Uses ``response_mime_type="application/json"`` so the output is
     guaranteed to be parseable JSON, which enables reliable aggregation.
+
+    ``_rate_limit_wait`` is called *inside* this function so that
+    tenacity retries also respect rate limits.
     """
+    _rate_limit_wait(_estimate_tokens(text_chunk))
     model = genai.GenerativeModel(
         model_name=config.LLM_MODEL,
         system_instruction=textwrap.dedent("""\
