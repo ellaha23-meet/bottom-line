@@ -146,29 +146,52 @@ def fetch_emails(creds: Credentials) -> list[dict]:
 
 
 def _extract_email_body(payload: dict) -> str:
-    """Recursively extract plain-text (or decoded HTML) from a Gmail payload."""
-    parts = payload.get("parts", [])
-    if not parts:
-        data = payload.get("body", {}).get("data", "")
-        if data:
-            return base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
-        return ""
+    """Extract the full text content from a Gmail message payload.
 
-    # Prefer text/plain, fall back to text/html
-    for mime in ("text/plain", "text/html"):
+    Collects ALL text/plain and text/html leaf parts recursively, then
+    returns whichever is longer.  This handles two common newsletter patterns:
+      - multipart/alternative with a stub text/plain + full text/html
+      - multipart/mixed with several content parts concatenated
+    """
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
+    _collect_email_parts(payload, plain_parts, html_parts)
+
+    plain = "\n".join(plain_parts).strip()
+    html  = "\n".join(html_parts).strip()
+
+    # If both exist, return whichever is more complete.
+    # A text/plain shorter than 20 % of the HTML is a stub → use HTML.
+    if plain and html:
+        return plain if len(plain) >= len(html) * 0.2 else html
+    return plain or html
+
+
+def _collect_email_parts(
+    payload: dict,
+    plain_parts: list[str],
+    html_parts: list[str],
+) -> None:
+    """Recursively walk a Gmail MIME payload and collect all text leaves."""
+    mime  = payload.get("mimeType", "")
+    parts = payload.get("parts", [])
+
+    if parts:
+        # Multipart container — recurse into every child
         for part in parts:
-            if part.get("mimeType") == mime:
-                data = part.get("body", {}).get("data", "")
-                if data:
-                    decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
-                    if mime == "text/html":
-                        return BeautifulSoup(decoded, "html.parser").get_text(separator="\n")
-                    return decoded
-            # Handle nested multipart
-            nested = _extract_email_body(part)
-            if nested:
-                return nested
-    return ""
+            _collect_email_parts(part, plain_parts, html_parts)
+    else:
+        # Leaf part — decode and store
+        data = payload.get("body", {}).get("data", "")
+        if not data:
+            return
+        decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
+        if mime == "text/plain":
+            plain_parts.append(decoded)
+        elif mime == "text/html":
+            html_parts.append(
+                BeautifulSoup(decoded, "html.parser").get_text(separator="\n")
+            )
 
 
 # ===================================================================
