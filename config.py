@@ -59,8 +59,7 @@ LLM_MAX_TOKENS = 32768
 # RPM=10, RPD=250, TPM=250 000, context=1 000 000 tokens
 # We use conservative delays to stay well within these limits.
 CHUNK_MAX_CHARS = 400_000        # ~100k tokens per chunk (safe for 250k TPM/min)
-LLM_DELAY_HEAVY = 60            # seconds between large extraction calls
-LLM_DELAY_LIGHT = 15            # seconds between smaller ranking calls
+LLM_DELAY_HEAVY = 60            # seconds between all LLM calls (ensures TPM budget resets)
 MAX_MENTIONS_CHARS = 600_000    # cap combined mentions text for ranking calls
 
 # ---------------------------------------------------------------------------

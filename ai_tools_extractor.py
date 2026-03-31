@@ -256,10 +256,20 @@ def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dic
     for title, url, date_str in link_candidates[:5]:
         log.info("     sample: [%s] %s (%s)", date_str, title[:60], url[:80])
 
+    skipped_old = 0
+    skipped_no_date = 0
+    included = 0
+    fetch_failures = 0
+
     for title, url, date_str in link_candidates[: config.MAX_ARTICLES_PER_SOURCE]:
         pub_date = _parse_date_safe(date_str)
         if pub_date and pub_date < cutoff:
+            skipped_old += 1
             continue  # older than LOOKBACK_DAYS — skip
+
+        if not pub_date:
+            skipped_no_date += 1
+            # Include articles with unparseable dates (could be within window)
 
         try:
             page_html = _fetch_page(url, page)
@@ -274,7 +284,9 @@ def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dic
         except Exception:
             log.warning("Could not fetch article: %s", url)
             content = title  # fall back to just the title
+            fetch_failures += 1
 
+        included += 1
         articles.append({
             "source": archive_url,
             "title": title,
@@ -283,6 +295,10 @@ def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dic
             "content": content[:8000],  # cap to avoid token explosion
         })
 
+    log.info(
+        "  -> %d included, %d skipped (too old), %d with unparseable dates (included anyway), %d fetch failures",
+        included, skipped_old, skipped_no_date, fetch_failures,
+    )
     return articles
 
 
@@ -433,9 +449,13 @@ def _chunk_text(text: str, max_chars: int) -> list[str]:
     return chunks
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=60, max=120))
 def _llm_extract_tools(text_chunk: str) -> str:
-    """Ask the LLM to list AI tools mentioned in a text chunk."""
+    """Ask the LLM to list AI tools mentioned in a text chunk.
+
+    Uses 60-120s retry waits so a 429 rate-limit error has time to clear
+    before the next attempt (TPM resets per calendar minute).
+    """
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
     model = genai.GenerativeModel(
         model_name=config.LLM_MODEL,
@@ -451,13 +471,14 @@ def _llm_extract_tools(text_chunk: str) -> str:
         generation_config=genai.GenerationConfig(
             max_output_tokens=config.LLM_MAX_TOKENS,
             temperature=0.2,
+            response_mime_type="application/json",
         ),
     )
     response = model.generate_content(text_chunk)
     return response.text
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=60, max=120))
 def _llm_tools_log(mentions_text: str) -> list:
     """Ask the LLM for the top 25 tools ranked by mentions."""
     prompt = textwrap.dedent(f"""\
@@ -498,7 +519,7 @@ def _llm_tools_log(mentions_text: str) -> list:
     return json.loads(response.text)
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=60, max=120))
 def _llm_field_tools(mentions_text: str) -> list:
     """Ask the LLM for the top 5 tools per category."""
     categories_str = "\n".join(f"- {c}" for c in config.CATEGORIES)
@@ -553,10 +574,27 @@ def _llm_rank_and_categorise(mentions_text: str) -> dict:
     """
     log.info("LLM tools_log pass …")
     tools_log = _llm_tools_log(mentions_text)
-    log.info("Rate-limit pause (%ds) …", config.LLM_DELAY_LIGHT)
-    time.sleep(config.LLM_DELAY_LIGHT)
+    if len(tools_log) < 25:
+        log.warning("tools_log returned only %d tools (expected 25).", len(tools_log))
+
+    # Both ranking calls embed the full mentions_text, so each can use
+    # substantial tokens.  Use HEAVY delay to ensure the TPM budget resets.
+    log.info("Rate-limit pause (%ds) …", config.LLM_DELAY_HEAVY)
+    time.sleep(config.LLM_DELAY_HEAVY)
+
     log.info("LLM field_tools pass …")
     field_tools = _llm_field_tools(mentions_text)
+
+    # Validate category coverage
+    categories_found = {e.get("field") for e in field_tools}
+    missing = set(config.CATEGORIES) - categories_found
+    if missing:
+        log.warning("field_tools missing categories: %s", missing)
+    for cat in config.CATEGORIES:
+        cat_tools = [e for e in field_tools if e.get("field") == cat]
+        if len(cat_tools) < 5:
+            log.warning("Category '%s' has only %d tools (expected 5).", cat, len(cat_tools))
+
     return {"tools_log": tools_log, "field_tools": field_tools}
 
 
