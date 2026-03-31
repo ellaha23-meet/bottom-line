@@ -58,9 +58,16 @@ LLM_MAX_TOKENS = 32768
 # ---------------------------------------------------------------------------
 # RPM=10, RPD=250, TPM=250 000, context=1 000 000 tokens
 # We use conservative delays to stay well within these limits.
-CHUNK_MAX_CHARS = 400_000        # ~100k tokens per chunk (safe for 250k TPM/min)
+#
+# Token budget per call:
+#   600k chars / 4 chars-per-token = 150k input tokens
+#   + 32k output tokens = 182k total < 250k TPM at 1 call/min  ✓
+CHUNK_MAX_CHARS = 600_000        # ~150k tokens per chunk
+CONTENT_CAP_CHARS = 25_000      # per-article/email content cap
+                                 # (AI newsletters are typically 2k-5k words =
+                                 #  10k-25k chars; 8000 was cutting off 60%+)
 LLM_DELAY_HEAVY = 60            # seconds between all LLM calls (ensures TPM budget resets)
-MAX_MENTIONS_CHARS = 600_000    # cap combined mentions text for ranking calls
+MAX_MENTIONS_CHARS = 800_000    # cap combined mentions text for ranking calls
 
 # ---------------------------------------------------------------------------
 # Scraping / time-window settings

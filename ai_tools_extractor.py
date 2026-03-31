@@ -321,7 +321,7 @@ def _scrape_single_archive(
             "title": title,
             "date": date_str,
             "url": url,
-            "content": content[:8000],  # cap to avoid token explosion
+            "content": content[: config.CONTENT_CAP_CHARS],
         })
 
     log.info(
@@ -435,7 +435,7 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
         digest_parts.append(
             f"[Source: Gmail / {config.GMAIL_LABEL}]\n"
             f"Subject: {email['subject']}\nDate: {email['date']}\n"
-            f"Content:\n{email['body'][:8000]}\n{'---'}\n"
+            f"Content:\n{email['body'][:config.CONTENT_CAP_CHARS]}\n{'---'}\n"
         )
 
     full_digest = "\n".join(digest_parts)
@@ -499,17 +499,27 @@ def _llm_extract_tools(text_chunk: str) -> str:
     model = genai.GenerativeModel(
         model_name=config.LLM_MODEL,
         system_instruction=textwrap.dedent("""\
-            You are an AI-tools analyst. Given newsletter content, extract
-            every AI tool mentioned. For each tool output:
-            - Tool Name
-            - Sentiment (positive / neutral / negative)
-            - Short description (1 sentence)
-            - Source URL of the tool (if mentioned, else "N/A")
-            Return the results as a JSON array of objects.
+            You are an AI-tools analyst. Your job is to extract EVERY AI tool
+            mentioned in the newsletter content — do not skip any, no matter how
+            briefly the tool is mentioned.
+
+            Rules:
+            - Include tools mentioned in passing, in lists, in headlines, and in
+              body text.
+            - Include major platforms (ChatGPT, Claude, Gemini, NotebookLM,
+              Copilot, Midjourney, etc.) even when they seem obvious.
+            - Use the tool's canonical name (e.g. "NotebookLM" not "Notebook LM"
+              or "Google NotebookLM"; "Claude" not "Anthropic Claude").
+            - Sentiment: "positive" = praised/recommended/featured positively,
+              "negative" = criticised, "neutral" = mentioned factually.
+            - source_url: the tool's own website if stated, otherwise "N/A".
+
+            Return a JSON array where each element has exactly these keys:
+            tool_name, sentiment, description, source_url
         """),
         generation_config=genai.GenerationConfig(
             max_output_tokens=config.LLM_MAX_TOKENS,
-            temperature=0.2,
+            temperature=0.1,
             response_mime_type="application/json",
         ),
     )
@@ -521,24 +531,32 @@ def _llm_extract_tools(text_chunk: str) -> str:
 def _llm_tools_log(mentions_text: str) -> list:
     """Ask the LLM for the top 25 tools ranked by mentions."""
     prompt = textwrap.dedent(f"""\
-        Below are AI tool mentions extracted from multiple newsletter sources.
-        Return a JSON array of the top 25 tools sorted by positive mentions (descending).
+        Below are AI tool mentions extracted from multiple newsletter sources
+        over the past 21 days.
+
+        Task: return a JSON array of exactly the TOP 25 tools sorted by total
+        positive mention count (descending).
+
+        IMPORTANT — before counting:
+        - Merge name variants into one entry (e.g. "Notebook LM", "NotebookLM",
+          and "Google NotebookLM" are the same tool → use canonical name).
+        - Count every positive mention across ALL chunks of data below.
 
         OUTPUT FORMAT (valid JSON array only, no markdown):
         [
           {{
-            "tool_name": "...",
-            "category": "...",
-            "mentions": <int>,
-            "description": "1 sentence.",
-            "source_link": "https://..."
+            "tool_name": "canonical tool name",
+            "category": "one of the 12 task categories",
+            "mentions": <int — total positive mention count>,
+            "description": "1 sentence describing what the tool does.",
+            "source_link": "https://tool-own-website.com"
           }}
         ]
 
         RULES:
-        - "mentions" = count of positive mentions across all sources.
-        - "source_link" = the tool's own website, not the newsletter.
-        - "description" = 1 sentence max.
+        - Return exactly 25 items (or fewer only if fewer than 25 distinct tools exist).
+        - "mentions" = total count of positive sentiment mentions across all sources.
+        - "source_link" = the tool's own website, NOT a newsletter URL.
 
         MENTIONS DATA:
         {mentions_text}
@@ -564,28 +582,35 @@ def _llm_field_tools(mentions_text: str) -> list:
     categories_str = "\n".join(f"- {c}" for c in config.CATEGORIES)
 
     prompt = textwrap.dedent(f"""\
-        Below are AI tool mentions extracted from multiple newsletter sources.
-        For EACH of the 12 categories below, return the top 5 tools ranked 1-5.
+        Below are AI tool mentions extracted from multiple newsletter sources
+        over the past 21 days.
+
+        Task: for EACH of the 12 categories below, return the top 5 tools
+        ranked by positive mention count (rank 1 = most mentioned/recommended).
+
+        IMPORTANT — before ranking:
+        - Merge name variants into one entry (e.g. "Notebook LM" and
+          "NotebookLM" are the same tool → use canonical name).
+        - Consider ALL mentions across all chunks of data below.
 
         CATEGORIES:
         {categories_str}
 
-        OUTPUT FORMAT (valid JSON array only, no markdown):
+        OUTPUT FORMAT (valid JSON array, no markdown):
         [
           {{
-            "field": "<category name>",
-            "rank": <1-5>,
-            "tool_name": "...",
-            "why_recommended": "1 sentence.",
-            "url": "https://..."
+            "field": "<exact category name from the list above>",
+            "rank": <1–5>,
+            "tool_name": "canonical tool name",
+            "why_recommended": "1 sentence explaining why it ranked here.",
+            "url": "https://tool-own-website.com"
           }}
         ]
 
         RULES:
-        - rank 1 = best in category.
+        - Produce entries for ALL 12 categories (60 entries total).
         - If fewer than 5 tools exist for a category, include as many as possible.
-        - "url" = the tool's own website.
-        - "why_recommended" = 1 sentence max.
+        - "url" = the tool's own website, NOT a newsletter URL.
 
         MENTIONS DATA:
         {mentions_text}
