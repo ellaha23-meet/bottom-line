@@ -308,7 +308,10 @@ def _scrape_single_archive(
     fetch_failures = 0
     truncated = 0
     consecutive_old = 0
-    MAX_CONSECUTIVE_OLD = 3  # stop after 3 confirmed-old in a row
+    MAX_CONSECUTIVE_OLD = 7  # stop after 7 confirmed-old in a row
+    # 7 gives headroom for archives that mix pinned/featured posts
+    # (which may appear before the date-sorted run) while still
+    # avoiding fetching hundreds of genuinely old articles.
     content_lengths: list[int] = []
 
     for title, url, date_str in link_candidates[: config.MAX_ARTICLES_PER_SOURCE]:
@@ -388,8 +391,11 @@ def _scrape_single_archive(
 def _find_article_links(soup: BeautifulSoup, archive_url: str) -> list[tuple[str, str, str]]:
     """Heuristically extract (title, url, date_string) tuples from an archive page.
 
-    All strategies deduplicate by URL to avoid fetching the same article twice
-    (e.g. thumbnail link + title link to the same post).
+    Strategy 1 (Substack selectors) and Strategy 2 (URL-path patterns) are
+    always both attempted and their results merged — Strategy 2 is NOT skipped
+    just because Strategy 1 found some links.  Strategy 3 (broad fallback) runs
+    only when both S1 and S2 found nothing, to avoid polluting results with
+    nav/footer links.
     """
     base = "/".join(archive_url.split("/")[:3])  # scheme + host
     results: list[tuple[str, str, str]] = []
@@ -400,7 +406,7 @@ def _find_article_links(soup: BeautifulSoup, archive_url: str) -> list[tuple[str
             seen_urls.add(href)
             results.append((title, href, date_str))
 
-    # Strategy 1: Substack-style archives (<a class="post-preview-title"> or similar)
+    # Strategy 1: Substack-style archives
     for a_tag in soup.select("a[data-post-id], a.post-preview-title, a.post-preview"):
         href = a_tag.get("href", "")
         if not href.startswith("http"):
@@ -410,31 +416,49 @@ def _find_article_links(soup: BeautifulSoup, archive_url: str) -> list[tuple[str
         if title:
             _add(title, href, date_str)
 
-    # Strategy 2: Generic — any <a> whose href contains "/p/" or "/post/" or "/newsletter/"
-    if not results:
-        for a_tag in soup.find_all("a", href=True):
-            href = a_tag["href"]
-            if any(seg in href for seg in ["/p/", "/post/", "/newsletter/", "/i/"]):
-                if not href.startswith("http"):
-                    href = base + href
-                title = a_tag.get_text(strip=True) or href.split("/")[-1]
-                date_str = _find_nearby_date(a_tag)
-                if title:
-                    _add(title, href, date_str)
+    s1_count = len(results)
 
-    # Strategy 3: Broad fallback — grab all links that look like articles
+    # Strategy 2: URL-path patterns covering Beehiiv (/p/), Ghost (/posts/),
+    # Substack (/p/), and other common newsletter platforms.
+    # Runs regardless of Strategy 1 results so the two supplement each other.
+    _S2_SEGMENTS = (
+        "/p/", "/post/", "/posts/", "/newsletter/", "/newsletters/",
+        "/i/", "/issues/", "/issue/", "/editions/", "/edition/",
+        "/articles/", "/article/", "/blog/", "/entry/",
+    )
+    for a_tag in soup.find_all("a", href=True):
+        href = a_tag["href"]
+        if any(seg in href for seg in _S2_SEGMENTS):
+            if not href.startswith("http"):
+                href = base + href
+            title = a_tag.get_text(strip=True) or href.split("/")[-1]
+            date_str = _find_nearby_date(a_tag)
+            if title:
+                _add(title, href, date_str)
+
+    s2_count = len(results) - s1_count
+    log.info(
+        "  -> link strategies: S1(Substack)=%d  S2(url-path)=%d  total=%d",
+        s1_count, s2_count, len(results),
+    )
+
+    # Strategy 3: broad fallback — only if S1+S2 found nothing
     if not results:
+        log.warning(
+            "  -> S1+S2 found no links on %s — using broad fallback (may include nav links)",
+            archive_url,
+        )
         for a_tag in soup.find_all("a", href=True):
             href = a_tag["href"]
             if not href.startswith("http"):
                 href = base + href
-            # Skip navigation / footer links
             if any(skip in href for skip in ["#", "javascript:", "/archive", "/login", "/subscribe"]):
                 continue
             title = a_tag.get_text(strip=True)
             if title and len(title) > 15:
                 date_str = _find_nearby_date(a_tag)
                 _add(title, href, date_str)
+        log.info("  -> S3(broad fallback)=%d links", len(results))
 
     return results
 
