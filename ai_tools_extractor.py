@@ -183,7 +183,7 @@ def _fetch_page(url: str, page) -> str:
 
 
 def scrape_archives() -> list[dict]:
-    """Scrape all configured archive URLs for posts from the last 14 days.
+    """Scrape all configured archive URLs for posts from the last LOOKBACK_DAYS days.
 
     Returns a list of dicts: ``{"source": ..., "title": ..., "date": ...,
     "url": ..., "content": ...}``.
@@ -259,7 +259,7 @@ def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dic
     for title, url, date_str in link_candidates[: config.MAX_ARTICLES_PER_SOURCE]:
         pub_date = _parse_date_safe(date_str)
         if pub_date and pub_date < cutoff:
-            continue  # older than 14 days — skip
+            continue  # older than LOOKBACK_DAYS — skip
 
         try:
             page_html = _fetch_page(url, page)
@@ -380,24 +380,38 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
         digest_parts.append(
             f"[Source: Gmail / {config.GMAIL_LABEL}]\n"
             f"Subject: {email['subject']}\nDate: {email['date']}\n"
-            f"Content:\n{email['body'][:6000]}\n{'---'}\n"
+            f"Content:\n{email['body'][:8000]}\n{'---'}\n"
         )
 
-    # Split into chunks for the LLM (≈800 000 chars ≈ 200k tokens, fits in 1-2 chunks)
-    chunks = _chunk_text("\n".join(digest_parts), max_chars=800_000)
+    full_digest = "\n".join(digest_parts)
+    log.info("Total digest size: %d chars (~%dk tokens).", len(full_digest), len(full_digest) // 4000)
+
+    # Split into chunks that stay within 250k TPM budget per minute
+    chunks = _chunk_text(full_digest, max_chars=config.CHUNK_MAX_CHARS)
+    log.info("Split into %d chunk(s) for LLM extraction.", len(chunks))
 
     # Phase 1: extract raw tool mentions from each chunk
     raw_mentions: list[str] = []
     for i, chunk in enumerate(chunks):
-        log.info("LLM extraction pass %d/%d …", i + 1, len(chunks))
+        log.info("LLM extraction pass %d/%d (%d chars) …", i + 1, len(chunks), len(chunk))
         raw_mentions.append(_llm_extract_tools(chunk))
         if i < len(chunks) - 1:
-            time.sleep(15)  # 5 RPM limit: wait 15s between chunks
+            # 60s between heavy calls: ~100k input + 32k output ≈ 132k tokens/call
+            # At 1 call/min we stay well under 250k TPM
+            log.info("Rate-limit pause (%ds) …", config.LLM_DELAY_HEAVY)
+            time.sleep(config.LLM_DELAY_HEAVY)
 
     # Phase 2: aggregate, rank, and categorise
     combined_mentions = "\n\n".join(raw_mentions)
-    log.info("LLM ranking & categorisation pass …")
-    time.sleep(15)  # wait before ranking call to respect rate limit
+    # Guard against ranking prompt exceeding context window
+    if len(combined_mentions) > config.MAX_MENTIONS_CHARS:
+        log.warning(
+            "Combined mentions (%d chars) exceed cap (%d). Truncating.",
+            len(combined_mentions), config.MAX_MENTIONS_CHARS,
+        )
+        combined_mentions = combined_mentions[: config.MAX_MENTIONS_CHARS]
+    log.info("LLM ranking & categorisation pass (%d chars of mentions) …", len(combined_mentions))
+    time.sleep(config.LLM_DELAY_HEAVY)  # wait before ranking calls
     final_json = _llm_rank_and_categorise(combined_mentions)
 
     return final_json
@@ -531,12 +545,16 @@ def _llm_field_tools(mentions_text: str) -> list:
     return json.loads(response.text)
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
 def _llm_rank_and_categorise(mentions_text: str) -> dict:
-    """Run two separate LLM calls for tools_log and field_tools."""
+    """Run two separate LLM calls for tools_log and field_tools.
+
+    No @retry here — inner functions already retry individually.
+    Outer retry would cause 3×3 = 9 attempts, wasting RPD quota.
+    """
     log.info("LLM tools_log pass …")
     tools_log = _llm_tools_log(mentions_text)
-    time.sleep(15)
+    log.info("Rate-limit pause (%ds) …", config.LLM_DELAY_LIGHT)
+    time.sleep(config.LLM_DELAY_LIGHT)
     log.info("LLM field_tools pass …")
     field_tools = _llm_field_tools(mentions_text)
     return {"tools_log": tools_log, "field_tools": field_tools}
@@ -661,9 +679,16 @@ def main() -> None:
         log.warning("No content collected from any source. Exiting.")
         return
 
+    # Log per-source coverage for verification
+    source_counts: dict[str, int] = {}
+    for art in articles:
+        src = art.get("source", "unknown")
+        source_counts[src] = source_counts.get(src, 0) + 1
+    for src, cnt in sorted(source_counts.items()):
+        log.info("  Archive source: %s → %d articles", src, cnt)
     log.info(
-        "Collected %d articles and %d emails. Sending to LLM for analysis …",
-        len(articles), len(emails),
+        "Collected %d articles and %d emails (%d total). Sending to LLM for analysis …",
+        len(articles), len(emails), len(articles) + len(emails),
     )
 
     # Step 3: LLM analysis
