@@ -182,8 +182,18 @@ def _collect_email_parts(
             _collect_email_parts(part, plain_parts, html_parts)
     else:
         # Leaf part — decode and store
-        data = payload.get("body", {}).get("data", "")
+        body = payload.get("body", {})
+        data = body.get("data", "")
         if not data:
+            # body.size > 0 but no inline data means Gmail stored it as a
+            # separate attachment (only happens for parts > ~2 MB, which
+            # never occurs for text newsletter emails).
+            if body.get("size", 0) > 0:
+                log.warning(
+                    "Email part '%s' has size=%d but no inline data "
+                    "(stored as attachment — content will be missing).",
+                    mime, body["size"],
+                )
             return
         decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
         if mime == "text/plain":
