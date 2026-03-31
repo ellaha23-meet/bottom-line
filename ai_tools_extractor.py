@@ -16,7 +16,6 @@ import base64
 import json
 import logging
 import os
-import re
 import textwrap
 import time
 from datetime import datetime, timedelta, timezone
@@ -187,9 +186,12 @@ def scrape_archives() -> list[dict]:
 
     Returns a list of dicts: ``{"source": ..., "title": ..., "date": ...,
     "url": ..., "content": ...}``.
+    Deduplicates article URLs across archives to avoid wasting tokens on
+    cross-posted or syndicated content.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=config.LOOKBACK_DAYS)
     all_articles: list[dict] = []
+    seen_urls: set[str] = set()  # cross-archive URL dedup
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
@@ -210,7 +212,7 @@ def scrape_archives() -> list[dict]:
         for archive_url in config.ARCHIVE_URLS:
             log.info("Scraping archive: %s", archive_url)
             try:
-                articles = _scrape_single_archive(archive_url, cutoff, page)
+                articles = _scrape_single_archive(archive_url, cutoff, page, seen_urls)
                 log.info("  -> collected %d articles", len(articles))
                 all_articles.extend(articles)
             except Exception:
@@ -222,8 +224,18 @@ def scrape_archives() -> list[dict]:
     return all_articles
 
 
-def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dict]:
-    """Parse an archive page and fetch individual article content."""
+def _scrape_single_archive(
+    archive_url: str, cutoff: datetime, page, seen_urls: set[str]
+) -> list[dict]:
+    """Parse an archive page and fetch individual article content.
+
+    ``seen_urls`` is a shared set across all archives — articles whose URL
+    was already collected from a previous archive are skipped to save tokens.
+
+    Archives are typically sorted newest-first, so once we hit several
+    consecutive confirmed-old articles we stop early instead of fetching
+    the remaining hundreds of old posts one by one.
+    """
     # Navigate to the archive page
     try:
         page.goto(archive_url, wait_until="networkidle", timeout=config.REQUEST_TIMEOUT * 1000)
@@ -242,7 +254,7 @@ def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dic
 
     html = page.content()
 
-    # Save rendered HTML for debugging (first archive only)
+    # Save rendered HTML for debugging
     debug_file = f"debug_{archive_url.split('/')[2]}.html"
     with open(debug_file, "w", encoding="utf-8") as f:
         f.write(html)
@@ -257,15 +269,32 @@ def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dic
         log.info("     sample: [%s] %s (%s)", date_str, title[:60], url[:80])
 
     skipped_old = 0
+    skipped_dup = 0
     skipped_no_date = 0
     included = 0
     fetch_failures = 0
+    consecutive_old = 0
+    MAX_CONSECUTIVE_OLD = 3  # stop after 3 confirmed-old in a row
 
     for title, url, date_str in link_candidates[: config.MAX_ARTICLES_PER_SOURCE]:
         pub_date = _parse_date_safe(date_str)
         if pub_date and pub_date < cutoff:
             skipped_old += 1
+            consecutive_old += 1
+            if consecutive_old >= MAX_CONSECUTIVE_OLD:
+                log.info(
+                    "  -> early stop: %d consecutive articles older than %d days",
+                    MAX_CONSECUTIVE_OLD, config.LOOKBACK_DAYS,
+                )
+                break
             continue  # older than LOOKBACK_DAYS — skip
+        consecutive_old = 0  # reset on in-range or unparseable date
+
+        # Cross-archive deduplication
+        if url in seen_urls:
+            skipped_dup += 1
+            continue
+        seen_urls.add(url)
 
         if not pub_date:
             skipped_no_date += 1
@@ -296,16 +325,27 @@ def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dic
         })
 
     log.info(
-        "  -> %d included, %d skipped (too old), %d with unparseable dates (included anyway), %d fetch failures",
-        included, skipped_old, skipped_no_date, fetch_failures,
+        "  -> %d included, %d skipped (old), %d skipped (dup), "
+        "%d unparseable dates (included), %d fetch failures",
+        included, skipped_old, skipped_dup, skipped_no_date, fetch_failures,
     )
     return articles
 
 
 def _find_article_links(soup: BeautifulSoup, archive_url: str) -> list[tuple[str, str, str]]:
-    """Heuristically extract (title, url, date_string) tuples from an archive page."""
+    """Heuristically extract (title, url, date_string) tuples from an archive page.
+
+    All strategies deduplicate by URL to avoid fetching the same article twice
+    (e.g. thumbnail link + title link to the same post).
+    """
     base = "/".join(archive_url.split("/")[:3])  # scheme + host
     results: list[tuple[str, str, str]] = []
+    seen_urls: set[str] = set()
+
+    def _add(title: str, href: str, date_str: str) -> None:
+        if href not in seen_urls:
+            seen_urls.add(href)
+            results.append((title, href, date_str))
 
     # Strategy 1: Substack-style archives (<a class="post-preview-title"> or similar)
     for a_tag in soup.select("a[data-post-id], a.post-preview-title, a.post-preview"):
@@ -313,10 +353,9 @@ def _find_article_links(soup: BeautifulSoup, archive_url: str) -> list[tuple[str
         if not href.startswith("http"):
             href = base + href
         title = a_tag.get_text(strip=True)
-        # Look for a sibling/parent time tag
         date_str = _find_nearby_date(a_tag)
         if title:
-            results.append((title, href, date_str))
+            _add(title, href, date_str)
 
     # Strategy 2: Generic — any <a> whose href contains "/p/" or "/post/" or "/newsletter/"
     if not results:
@@ -327,8 +366,8 @@ def _find_article_links(soup: BeautifulSoup, archive_url: str) -> list[tuple[str
                     href = base + href
                 title = a_tag.get_text(strip=True) or href.split("/")[-1]
                 date_str = _find_nearby_date(a_tag)
-                if title and href not in [r[1] for r in results]:
-                    results.append((title, href, date_str))
+                if title:
+                    _add(title, href, date_str)
 
     # Strategy 3: Broad fallback — grab all links that look like articles
     if not results:
@@ -342,7 +381,7 @@ def _find_article_links(soup: BeautifulSoup, archive_url: str) -> list[tuple[str
             title = a_tag.get_text(strip=True)
             if title and len(title) > 15:
                 date_str = _find_nearby_date(a_tag)
-                results.append((title, href, date_str))
+                _add(title, href, date_str)
 
     return results
 
