@@ -46,6 +46,50 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Rate-limit helpers
+# ---------------------------------------------------------------------------
+_last_llm_call_time: float = 0.0   # timestamp of the most recent LLM call
+_llm_calls_today: int = 0          # simple counter for RPD awareness
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars per token for English text."""
+    return len(text) // 4
+
+
+def _rate_limit_wait(estimated_input_tokens: int) -> None:
+    """Sleep enough to respect RPM and TPM limits before the next LLM call.
+
+    Strategy: after every request we must wait long enough so that the
+    tokens from this request have "left" the 1-minute rolling window.
+    We also enforce a minimum gap of ``60 / RPM_LIMIT`` seconds.
+    """
+    global _last_llm_call_time, _llm_calls_today
+
+    estimated_total = estimated_input_tokens + config.LLM_MAX_TOKENS  # input + max output
+    # Seconds of TPM budget this request consumes
+    tpm_wait = (estimated_total / config.TPM_LIMIT) * 60
+    # Minimum gap for RPM
+    rpm_wait = 60 / config.RPM_LIMIT  # 6 s for RPM=10
+
+    required_gap = max(tpm_wait, rpm_wait)
+
+    now = time.time()
+    elapsed = now - _last_llm_call_time if _last_llm_call_time else required_gap
+    if elapsed < required_gap:
+        sleep_for = required_gap - elapsed + 1  # +1 s safety margin
+        log.info(
+            "Rate-limit: sleeping %.1fs (est. %d tokens, TPM gap=%.1fs, RPM gap=%.1fs)",
+            sleep_for, estimated_total, tpm_wait, rpm_wait,
+        )
+        time.sleep(sleep_for)
+
+    _last_llm_call_time = time.time()
+    _llm_calls_today += 1
+    if _llm_calls_today > config.RPD_LIMIT * 0.8:
+        log.warning("Approaching daily request limit: %d / %d RPD used.", _llm_calls_today, config.RPD_LIMIT)
+
+# ---------------------------------------------------------------------------
 # Google OAuth scopes
 # ---------------------------------------------------------------------------
 SCOPES = [
@@ -366,6 +410,9 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
 
     Returns a dict with keys ``"tools_log"`` and ``"field_tools"``.
     """
+    # Configure Gemini once for the whole analysis phase
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+
     # Build a combined text digest for the LLM
     digest_parts: list[str] = []
 
@@ -383,22 +430,37 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
             f"Content:\n{email['body'][:6000]}\n{'---'}\n"
         )
 
-    # Split into chunks for the LLM (≈800 000 chars ≈ 200k tokens, fits in 1-2 chunks)
-    chunks = _chunk_text("\n".join(digest_parts), max_chars=800_000)
+    full_digest = "\n".join(digest_parts)
+    log.info(
+        "Total digest size: %d chars ≈ %d tokens (from %d articles + %d emails)",
+        len(full_digest), _estimate_tokens(full_digest), len(articles), len(emails),
+    )
+
+    # Split into chunks that fit within the context window while leaving room
+    # for the system prompt and output.  800k chars ≈ 200k tokens; with 32k
+    # output headroom and system prompt, this stays well inside the 1M context.
+    chunks = _chunk_text(full_digest, max_chars=800_000)
+    log.info("Split into %d chunk(s) for extraction.", len(chunks))
 
     # Phase 1: extract raw tool mentions from each chunk
     raw_mentions: list[str] = []
     for i, chunk in enumerate(chunks):
-        log.info("LLM extraction pass %d/%d …", i + 1, len(chunks))
+        log.info("LLM extraction pass %d/%d (%d chars) …", i + 1, len(chunks), len(chunk))
+        _rate_limit_wait(_estimate_tokens(chunk))
         raw_mentions.append(_llm_extract_tools(chunk))
-        if i < len(chunks) - 1:
-            time.sleep(15)  # 5 RPM limit: wait 15s between chunks
 
-    # Phase 2: aggregate, rank, and categorise
-    combined_mentions = "\n\n".join(raw_mentions)
+    # Phase 2: aggregate extracted mentions into a clean summary so the
+    # ranking LLM gets a concise, pre-counted input (no tool is lost in
+    # a wall of raw text).
+    aggregated = _aggregate_mentions(raw_mentions)
+    log.info(
+        "Aggregated mentions: %d chars ≈ %d tokens",
+        len(aggregated), _estimate_tokens(aggregated),
+    )
+
+    # Phase 3: rank and categorise
     log.info("LLM ranking & categorisation pass …")
-    time.sleep(15)  # wait before ranking call to respect rate limit
-    final_json = _llm_rank_and_categorise(combined_mentions)
+    final_json = _llm_rank_and_categorise(aggregated)
 
     return final_json
 
@@ -419,24 +481,126 @@ def _chunk_text(text: str, max_chars: int) -> list[str]:
     return chunks
 
 
+def _aggregate_mentions(raw_mentions: list[str]) -> str:
+    """Parse extraction results and aggregate tool mentions.
+
+    Returns a condensed summary with per-tool mention counts so the ranking
+    LLM receives a clean, complete picture of every tool found.  Falls back
+    to raw concatenation if JSON parsing fails for all chunks.
+    """
+    all_tools: dict[str, dict] = {}  # tool_name -> aggregated data
+    unparsed_chunks: list[str] = []
+
+    for raw in raw_mentions:
+        # Strip markdown code fences that Gemini sometimes adds
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+        try:
+            tools = json.loads(cleaned)
+            if not isinstance(tools, list):
+                raise ValueError("Expected a JSON array")
+        except (json.JSONDecodeError, ValueError):
+            log.warning("Could not parse extraction chunk as JSON; keeping raw text.")
+            unparsed_chunks.append(raw)
+            continue
+
+        for tool in tools:
+            # Handle varying key names from the LLM
+            name = (
+                tool.get("Tool Name")
+                or tool.get("tool_name")
+                or tool.get("name")
+                or "Unknown"
+            ).strip()
+            sentiment = (
+                tool.get("Sentiment")
+                or tool.get("sentiment")
+                or "neutral"
+            ).lower().strip()
+            desc = (
+                tool.get("Short description")
+                or tool.get("description")
+                or ""
+            ).strip()
+            url = (
+                tool.get("Source URL")
+                or tool.get("source_url")
+                or tool.get("url")
+                or "N/A"
+            ).strip()
+
+            if name not in all_tools:
+                all_tools[name] = {
+                    "positive": 0,
+                    "neutral": 0,
+                    "negative": 0,
+                    "descriptions": [],
+                    "urls": set(),
+                }
+
+            entry = all_tools[name]
+            if sentiment in ("positive", "neutral", "negative"):
+                entry[sentiment] += 1
+            else:
+                entry["neutral"] += 1
+            if desc and desc not in entry["descriptions"]:
+                entry["descriptions"].append(desc)
+            if url and url != "N/A":
+                entry["urls"].add(url)
+
+    # Build the condensed summary
+    lines: list[str] = []
+    if all_tools:
+        sorted_tools = sorted(
+            all_tools.items(),
+            key=lambda x: x[1]["positive"],
+            reverse=True,
+        )
+        for name, data in sorted_tools:
+            total = data["positive"] + data["neutral"] + data["negative"]
+            desc = data["descriptions"][0] if data["descriptions"] else ""
+            urls = ", ".join(sorted(data["urls"])) if data["urls"] else "N/A"
+            lines.append(
+                f"Tool: {name} | Positive mentions: {data['positive']} | "
+                f"Neutral: {data['neutral']} | Negative: {data['negative']} | "
+                f"Total: {total} | Description: {desc} | URLs: {urls}"
+            )
+        log.info("Aggregated %d unique tools from parsed JSON.", len(all_tools))
+
+    # Append any unparsed chunks as fallback (so no content is lost)
+    if unparsed_chunks:
+        lines.append("\n--- RAW MENTIONS (could not parse as JSON) ---")
+        lines.extend(unparsed_chunks)
+        log.info("Included %d unparsed chunk(s) as raw text fallback.", len(unparsed_chunks))
+
+    return "\n".join(lines)
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
 def _llm_extract_tools(text_chunk: str) -> str:
-    """Ask the LLM to list AI tools mentioned in a text chunk."""
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    """Ask the LLM to list AI tools mentioned in a text chunk.
+
+    Uses ``response_mime_type="application/json"`` so the output is
+    guaranteed to be parseable JSON, which enables reliable aggregation.
+    """
     model = genai.GenerativeModel(
         model_name=config.LLM_MODEL,
         system_instruction=textwrap.dedent("""\
             You are an AI-tools analyst. Given newsletter content, extract
             every AI tool mentioned. For each tool output:
-            - Tool Name
-            - Sentiment (positive / neutral / negative)
-            - Short description (1 sentence)
-            - Source URL of the tool (if mentioned, else "N/A")
-            Return the results as a JSON array of objects.
+            - tool_name
+            - sentiment  (one of: positive, neutral, negative)
+            - description  (1 sentence)
+            - source_url  (the tool's own URL if mentioned, else "N/A")
+            Return the results as a JSON array of objects. Include EVERY
+            tool you find — do not skip any.
         """),
         generation_config=genai.GenerationConfig(
             max_output_tokens=config.LLM_MAX_TOKENS,
             temperature=0.2,
+            response_mime_type="application/json",
         ),
     )
     response = model.generate_content(text_chunk)
@@ -448,7 +612,8 @@ def _llm_tools_log(mentions_text: str) -> list:
     """Ask the LLM for the top 25 tools ranked by mentions."""
     prompt = textwrap.dedent(f"""\
         Below are AI tool mentions extracted from multiple newsletter sources.
-        Return a JSON array of the top 25 tools sorted by positive mentions (descending).
+        The mention counts are already pre-aggregated. Return a JSON array of
+        the top 25 tools sorted by positive mentions (descending).
 
         OUTPUT FORMAT (valid JSON array only, no markdown):
         [
@@ -462,15 +627,16 @@ def _llm_tools_log(mentions_text: str) -> list:
         ]
 
         RULES:
-        - "mentions" = count of positive mentions across all sources.
+        - "mentions" = use the pre-counted positive mentions from the data.
         - "source_link" = the tool's own website, not the newsletter.
         - "description" = 1 sentence max.
+        - Include exactly 25 tools (or fewer if fewer than 25 exist).
 
         MENTIONS DATA:
         {mentions_text}
     """)
 
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    _rate_limit_wait(_estimate_tokens(prompt))
     model = genai.GenerativeModel(
         model_name=config.LLM_MODEL,
         system_instruction="Return only a valid JSON array. No markdown.",
@@ -491,7 +657,9 @@ def _llm_field_tools(mentions_text: str) -> list:
 
     prompt = textwrap.dedent(f"""\
         Below are AI tool mentions extracted from multiple newsletter sources.
-        For EACH of the 12 categories below, return the top 5 tools ranked 1-5.
+        The mention counts are already pre-aggregated. For EACH of the
+        {len(config.CATEGORIES)} categories below, return the top 5 tools
+        ranked 1-5.
 
         CATEGORIES:
         {categories_str}
@@ -512,12 +680,13 @@ def _llm_field_tools(mentions_text: str) -> list:
         - If fewer than 5 tools exist for a category, include as many as possible.
         - "url" = the tool's own website.
         - "why_recommended" = 1 sentence max.
+        - You MUST include entries for ALL {len(config.CATEGORIES)} categories.
 
         MENTIONS DATA:
         {mentions_text}
     """)
 
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    _rate_limit_wait(_estimate_tokens(prompt))
     model = genai.GenerativeModel(
         model_name=config.LLM_MODEL,
         system_instruction="Return only a valid JSON array. No markdown.",
@@ -531,12 +700,15 @@ def _llm_field_tools(mentions_text: str) -> list:
     return json.loads(response.text)
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
 def _llm_rank_and_categorise(mentions_text: str) -> dict:
-    """Run two separate LLM calls for tools_log and field_tools."""
+    """Run two separate LLM calls for tools_log and field_tools.
+
+    No ``@retry`` here — the individual LLM functions already retry
+    internally.  A wrapper retry would re-run already-succeeded calls,
+    wasting RPD budget.
+    """
     log.info("LLM tools_log pass …")
     tools_log = _llm_tools_log(mentions_text)
-    time.sleep(15)
     log.info("LLM field_tools pass …")
     field_tools = _llm_field_tools(mentions_text)
     return {"tools_log": tools_log, "field_tools": field_tools}

@@ -54,6 +54,13 @@ LLM_MODEL = "gemini-2.5-flash"
 LLM_MAX_TOKENS = 32768
 
 # ---------------------------------------------------------------------------
+# Gemini API rate limits (adjust to match your API tier)
+# ---------------------------------------------------------------------------
+RPM_LIMIT = 10         # requests per minute
+RPD_LIMIT = 250        # requests per day
+TPM_LIMIT = 250_000    # tokens per minute
+
+# ---------------------------------------------------------------------------
 # Scraping / time-window settings
 # ---------------------------------------------------------------------------
 LOOKBACK_DAYS = 21
