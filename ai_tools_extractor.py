@@ -273,8 +273,10 @@ def _scrape_single_archive(
     skipped_no_date = 0
     included = 0
     fetch_failures = 0
+    truncated = 0
     consecutive_old = 0
     MAX_CONSECUTIVE_OLD = 3  # stop after 3 confirmed-old in a row
+    content_lengths: list[int] = []
 
     for title, url, date_str in link_candidates[: config.MAX_ARTICLES_PER_SOURCE]:
         pub_date = _parse_date_safe(date_str)
@@ -315,19 +317,37 @@ def _scrape_single_archive(
             content = title  # fall back to just the title
             fetch_failures += 1
 
+        raw_len = len(content)
+        content_lengths.append(raw_len)
+        if raw_len > config.CONTENT_CAP_CHARS:
+            truncated += 1
+            log.warning(
+                "  !! TRUNCATED article (%d → %d chars): %s",
+                raw_len, config.CONTENT_CAP_CHARS, url,
+            )
+        content = content[: config.CONTENT_CAP_CHARS]
+
         included += 1
         articles.append({
             "source": archive_url,
             "title": title,
             "date": date_str,
             "url": url,
-            "content": content[: config.CONTENT_CAP_CHARS],
+            "content": content,
         })
 
+    if content_lengths:
+        log.info(
+            "  -> content lengths — min: %d, avg: %d, max: %d chars",
+            min(content_lengths),
+            sum(content_lengths) // len(content_lengths),
+            max(content_lengths),
+        )
     log.info(
-        "  -> %d included, %d skipped (old), %d skipped (dup), "
-        "%d unparseable dates (included), %d fetch failures",
-        included, skipped_old, skipped_dup, skipped_no_date, fetch_failures,
+        "  -> %d included (%d TRUNCATED at %d chars), %d skipped (old), "
+        "%d skipped (dup), %d unparseable dates (included), %d fetch failures",
+        included, truncated, config.CONTENT_CAP_CHARS,
+        skipped_old, skipped_dup, skipped_no_date, fetch_failures,
     )
     return articles
 
@@ -431,12 +451,24 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
             f"Content:\n{art['content']}\n{'---'}\n"
         )
 
+    email_truncated = 0
     for email in emails:
+        body = email["body"]
+        if len(body) > config.CONTENT_CAP_CHARS:
+            email_truncated += 1
+            log.warning(
+                "  !! TRUNCATED email (%d → %d chars): %s",
+                len(body), config.CONTENT_CAP_CHARS, email.get("subject", ""),
+            )
         digest_parts.append(
             f"[Source: Gmail / {config.GMAIL_LABEL}]\n"
             f"Subject: {email['subject']}\nDate: {email['date']}\n"
-            f"Content:\n{email['body'][:config.CONTENT_CAP_CHARS]}\n{'---'}\n"
+            f"Content:\n{body[:config.CONTENT_CAP_CHARS]}\n{'---'}\n"
         )
+    if email_truncated:
+        log.warning("%d email(s) truncated at %d chars.", email_truncated, config.CONTENT_CAP_CHARS)
+    else:
+        log.info("All %d email(s) captured in full (none exceeded %d chars).", len(emails), config.CONTENT_CAP_CHARS)
 
     full_digest = "\n".join(digest_parts)
     log.info("Total digest size: %d chars (~%dk tokens).", len(full_digest), len(full_digest) // 4000)
