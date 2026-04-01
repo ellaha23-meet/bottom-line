@@ -394,11 +394,20 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
         if i < len(chunks) - 1:
             time.sleep(15)  # 5 RPM limit: wait 15s between chunks
 
-    # Phase 2: aggregate, rank, and categorise
+    # Phase 1.5: deterministic local counting & ranking
+    log.info("Counting positive mentions locally …")
+    pre_ranked = _parse_and_count_mentions(raw_mentions)
+    log.info(
+        "Local counting complete: %d tools with positive mentions (top: %s)",
+        len(pre_ranked),
+        pre_ranked[0]["tool_name"] if pre_ranked else "N/A",
+    )
+
+    # Phase 2: LLM enrichment (description/category only) + field_tools
     combined_mentions = "\n\n".join(raw_mentions)
-    log.info("LLM ranking & categorisation pass …")
+    log.info("LLM enrichment & categorisation pass …")
     time.sleep(15)  # wait before ranking call to respect rate limit
-    final_json = _llm_rank_and_categorise(combined_mentions)
+    final_json = _llm_rank_and_categorise(pre_ranked, combined_mentions)
 
     return final_json
 
@@ -428,29 +437,150 @@ def _llm_extract_tools(text_chunk: str) -> str:
         system_instruction=textwrap.dedent("""\
             You are an AI-tools analyst. Given newsletter content, extract
             every AI tool mentioned. For each tool output:
-            - Tool Name
-            - Sentiment (positive / neutral / negative)
-            - Short description (1 sentence)
-            - Source URL of the tool (if mentioned, else "N/A")
+            - tool_name (string)
+            - sentiment ("positive", "neutral", or "negative")
+            - description (1 sentence)
+            - source_url (if mentioned, else "N/A")
             Return the results as a JSON array of objects.
+            Each mention of a tool should be a separate entry — do NOT
+            deduplicate or aggregate; list every individual occurrence.
         """),
         generation_config=genai.GenerationConfig(
             max_output_tokens=config.LLM_MAX_TOKENS,
             temperature=0.2,
+            response_mime_type="application/json",
         ),
     )
     response = model.generate_content(text_chunk)
     return response.text
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
-def _llm_tools_log(mentions_text: str) -> list:
-    """Ask the LLM for the top 25 tools ranked by mentions."""
-    prompt = textwrap.dedent(f"""\
-        Below are AI tool mentions extracted from multiple newsletter sources.
-        Return a JSON array of the top 25 tools sorted by positive mentions (descending).
+def _parse_and_count_mentions(raw_mentions: list[str]) -> list[dict]:
+    """Parse Phase 1 JSON outputs and deterministically count positive mentions.
 
-        OUTPUT FORMAT (valid JSON array only, no markdown):
+    Returns a list of dicts sorted by positive mention count (descending):
+        [{"tool_name": str, "positive_mentions": int,
+          "descriptions": list[str], "source_urls": list[str]}, ...]
+    """
+    from collections import Counter
+
+    tool_positive_counts: Counter = Counter()
+    tool_descriptions: dict[str, list[str]] = {}
+    tool_urls: dict[str, list[str]] = {}
+
+    for raw in raw_mentions:
+        # Strip markdown fences if the LLM wrapped the JSON
+        text = raw.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+
+        try:
+            entries = json.loads(text)
+        except json.JSONDecodeError:
+            # Try to find a JSON array in the text
+            match = re.search(r"\[.*\]", text, re.DOTALL)
+            if match:
+                try:
+                    entries = json.loads(match.group())
+                except json.JSONDecodeError:
+                    log.warning("Could not parse Phase 1 chunk as JSON, skipping")
+                    continue
+            else:
+                log.warning("No JSON array found in Phase 1 chunk, skipping")
+                continue
+
+        if not isinstance(entries, list):
+            continue
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            # Normalise tool name: strip whitespace, title-case for grouping
+            name = entry.get("tool_name") or entry.get("Tool Name") or ""
+            name = name.strip()
+            if not name:
+                continue
+            # Canonical key: lowercased for dedup
+            key = name.lower()
+
+            sentiment = str(
+                entry.get("sentiment") or entry.get("Sentiment") or ""
+            ).strip().lower()
+
+            if sentiment == "positive":
+                tool_positive_counts[key] += 1
+
+            desc = (
+                entry.get("description")
+                or entry.get("Short description")
+                or entry.get("short_description")
+                or ""
+            )
+            url = (
+                entry.get("source_url")
+                or entry.get("Source URL")
+                or entry.get("source_link")
+                or "N/A"
+            )
+
+            # Keep the best-cased version of the name
+            tool_descriptions.setdefault(key, {"display_name": name, "descs": [], "urls": []})
+            if desc:
+                tool_descriptions[key]["descs"].append(desc.strip())
+            if url and url != "N/A":
+                tool_descriptions[key]["urls"].append(url.strip())
+
+    # Build ranked list (only tools with at least 1 positive mention)
+    ranked = []
+    for key, count in tool_positive_counts.most_common():
+        info = tool_descriptions.get(key, {})
+        ranked.append({
+            "tool_name": info.get("display_name", key),
+            "positive_mentions": count,
+            "descriptions": info.get("descs", [])[:3],  # keep up to 3 for LLM context
+            "source_urls": [u for u in dict.fromkeys(info.get("urls", []))],  # deduplicated
+        })
+
+    return ranked[:25]
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
+def _llm_tools_log(pre_ranked: list[dict]) -> list:
+    """Enrich pre-ranked tools with LLM-generated descriptions and categories.
+
+    Accepts *pre_ranked*: a list of dicts already sorted by verified positive
+    mention counts.  The LLM is only asked for a category and a polished
+    one-sentence description — it does NOT decide the ranking or counts.
+    """
+    tools_summary = json.dumps(
+        [
+            {
+                "tool_name": t["tool_name"],
+                "positive_mentions": t["positive_mentions"],
+                "sample_descriptions": t["descriptions"],
+                "source_urls": t["source_urls"],
+            }
+            for t in pre_ranked
+        ],
+        indent=2,
+    )
+
+    prompt = textwrap.dedent(f"""\
+        Below is a pre-ranked list of AI tools sorted by verified positive
+        mention count (descending).  The ranking and mention counts are
+        already verified — do NOT change them.
+
+        For each tool, add:
+        - "category": a short category label (e.g. "LLM", "Image Generation").
+        - "description": a polished 1-sentence description.
+        - "source_link": the tool's own website URL (not the newsletter).
+          Use the source_urls provided when available; otherwise infer the
+          official URL.
+
+        Return a JSON array preserving the exact order and mention counts.
+
+        OUTPUT FORMAT (valid JSON array only):
         [
           {{
             "tool_name": "...",
@@ -461,13 +591,8 @@ def _llm_tools_log(mentions_text: str) -> list:
           }}
         ]
 
-        RULES:
-        - "mentions" = count of positive mentions across all sources.
-        - "source_link" = the tool's own website, not the newsletter.
-        - "description" = 1 sentence max.
-
-        MENTIONS DATA:
-        {mentions_text}
+        PRE-RANKED TOOLS:
+        {tools_summary}
     """)
 
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
@@ -481,7 +606,17 @@ def _llm_tools_log(mentions_text: str) -> list:
         ),
     )
     response = model.generate_content(prompt)
-    return json.loads(response.text)
+    enriched = json.loads(response.text)
+
+    # Enforce the verified counts/order in case the LLM mutated them
+    tool_counts = {t["tool_name"].lower(): t["positive_mentions"] for t in pre_ranked}
+    for item in enriched:
+        key = item.get("tool_name", "").lower()
+        if key in tool_counts:
+            item["mentions"] = tool_counts[key]
+    enriched.sort(key=lambda x: x.get("mentions", 0), reverse=True)
+
+    return enriched
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
@@ -532,10 +667,10 @@ def _llm_field_tools(mentions_text: str) -> list:
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
-def _llm_rank_and_categorise(mentions_text: str) -> dict:
+def _llm_rank_and_categorise(pre_ranked: list[dict], mentions_text: str) -> dict:
     """Run two separate LLM calls for tools_log and field_tools."""
     log.info("LLM tools_log pass …")
-    tools_log = _llm_tools_log(mentions_text)
+    tools_log = _llm_tools_log(pre_ranked)
     time.sleep(15)
     log.info("LLM field_tools pass …")
     field_tools = _llm_field_tools(mentions_text)
