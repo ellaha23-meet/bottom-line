@@ -391,22 +391,39 @@ def _parse_date_safe(date_str: str) -> datetime | None:
 
 
 # ===================================================================
-# 4. LLM-Based Per-Source Tool Extraction
+# 4. LLM-Based Per-Source Tool Extraction (batched by source_id)
 # ===================================================================
+#
+# Rate-limit budget (Gemini free tier):
+#   RPM  = 10   →  sleep 7s between calls (≈6 effective RPM with API latency)
+#   RPD  = 250  →  batch all content per source_id into chunks
+#   TPM  = 250k →  cap each chunk to ~100k chars (≈25k tokens input)
+#                   25k input + ~3k output = ~28k tokens/call
+#                   28k × 6 effective RPM ≈ 168k TPM (safely under 250k)
+#   Context = 1M tokens → 25k tokens/call is well within
+#
+# With 15 sources (6 web + 9 email) at ~100k chars/chunk most sources
+# fit in 1-2 chunks → ~15-30 extraction + 2 ranking = ~17-32 RPD total.
+# ---------------------------------------------------------------------------
+
+CHARS_PER_CHUNK = 100_000          # ≈25k tokens input; keeps us under 250k TPM
+RATE_LIMIT_SLEEP = 7               # seconds between LLM calls (keeps us under 10 RPM)
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
-def _llm_extract_tools_from_source(text: str, source_id: str, source_url: str) -> list[dict]:
-    """Ask the LLM to extract AI tools from a single source's content.
+def _llm_extract_tools_from_chunk(text: str) -> list[dict]:
+    """Ask the LLM to extract AI tools from a text chunk.
 
     Returns a list of dicts with keys:
-        source_id, tool_name, sentiment, description, use_case, source_url
+        tool_name, sentiment, description, use_case
     """
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
     model = genai.GenerativeModel(
         model_name=config.LLM_MODEL,
         system_instruction=textwrap.dedent("""\
-            You are an AI-tools analyst. Given a single newsletter article or
-            email, extract every distinct AI tool mentioned. For each tool return
-            a JSON object with these exact keys:
+            You are an AI-tools analyst. Given newsletter / email content from
+            a single source, extract every distinct AI tool mentioned.
+            For each tool return a JSON object with these exact keys:
             - "tool_name": the canonical name of the tool
             - "sentiment": one of "positive", "neutral", or "negative"
             - "description": 1-sentence description of the tool
@@ -421,15 +438,66 @@ def _llm_extract_tools_from_source(text: str, source_id: str, source_url: str) -
             response_mime_type="application/json",
         ),
     )
-    response = model.generate_content(text[:30000])  # cap per-source input
-    raw_tools = json.loads(response.text)
+    response = model.generate_content(text)
+    return json.loads(response.text)
 
-    # Attach source metadata to each extracted tool
-    for tool in raw_tools:
-        tool["source_id"] = source_id
-        tool["source_url"] = source_url
 
-    return raw_tools
+def _chunk_text(text: str, max_chars: int) -> list[str]:
+    """Split text into chunks of approximately max_chars at paragraph boundaries."""
+    if len(text) <= max_chars:
+        return [text]
+    chunks, start = [], 0
+    while start < len(text):
+        end = start + max_chars
+        # Try to split at a paragraph boundary
+        boundary = text.rfind("\n---\n", start, end)
+        if boundary > start:
+            end = boundary + 5
+        chunks.append(text[start:end])
+        start = end
+    return chunks
+
+
+def _build_source_batches(articles: list[dict], emails: list[dict]) -> list[dict]:
+    """Group all content by source_id into batches for LLM extraction.
+
+    Returns a list of dicts:
+        {"source_id": ..., "source_url": ..., "text_chunks": [...]}
+    Each text_chunks entry is ≤ CHARS_PER_CHUNK characters.
+    """
+    # Group web articles by source_id
+    by_source: dict[str, dict] = defaultdict(lambda: {"parts": [], "source_url": ""})
+
+    for art in articles:
+        sid = art["source_id"]
+        by_source[sid]["source_url"] = art["source"]
+        by_source[sid]["parts"].append(
+            f"Title: {art['title']}\nDate: {art['date']}\n"
+            f"URL: {art['url']}\nContent:\n{art['content']}\n---\n"
+        )
+
+    # Group emails by source_id
+    for email in emails:
+        sid = email["source_id"]
+        by_source[sid]["source_url"] = f"email://{email['sender']}"
+        by_source[sid]["parts"].append(
+            f"Subject: {email['subject']}\nDate: {email['date']}\n"
+            f"Sender: {email['sender']}\nContent:\n{email['body']}\n---\n"
+        )
+
+    # Build chunked batches
+    batches = []
+    for source_id, data in by_source.items():
+        full_text = "\n".join(data["parts"])
+        chunks = _chunk_text(full_text, CHARS_PER_CHUNK)
+        batches.append({
+            "source_id": source_id,
+            "source_url": data["source_url"],
+            "text_chunks": chunks,
+            "article_count": len(data["parts"]),
+        })
+
+    return batches
 
 
 # ===================================================================
@@ -441,50 +509,58 @@ def _normalize_tool_name(name: str) -> str:
 
 
 def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
-    """Extract tools per-source, deterministically count cross-source mentions,
-    then send ranked data to the LLM for categorisation.
+    """Batch content by source_id, extract tools via LLM, deterministically
+    count cross-source positive mentions, then send ranked data to the LLM
+    for categorisation.
 
     Returns a dict with keys ``"tools_log"`` and ``"field_tools"``.
     """
+    # --- Group all content by source_id into chunks ---
+    batches = _build_source_batches(articles, emails)
+    total_chunks = sum(len(b["text_chunks"]) for b in batches)
+    log.info(
+        "Batched content into %d source(s), %d LLM chunk(s) total.",
+        len(batches), total_chunks,
+    )
+
+    # Pre-flight: warn if we'd exceed daily limit (extraction + 2 ranking)
+    estimated_calls = total_chunks + 2
+    if estimated_calls > 250:
+        log.warning(
+            "Estimated %d LLM calls would exceed 250 RPD limit. "
+            "Consider reducing LOOKBACK_DAYS or MAX_ARTICLES_PER_SOURCE.",
+            estimated_calls,
+        )
+
     all_mentions: list[dict] = []
+    call_count = 0
 
-    # --- Process web archive articles ---
-    total_web = len(articles)
-    for i, art in enumerate(articles):
-        log.info("LLM extraction: web article %d/%d [%s] %s",
-                 i + 1, total_web, art["source_id"], art["title"][:50])
-        text = (
-            f"Title: {art['title']}\nDate: {art['date']}\n"
-            f"URL: {art['url']}\nContent:\n{art['content']}"
+    for batch in batches:
+        source_id = batch["source_id"]
+        source_url = batch["source_url"]
+        log.info(
+            "Extracting tools from source '%s' (%d articles/emails, %d chunk(s)) …",
+            source_id, batch["article_count"], len(batch["text_chunks"]),
         )
-        try:
-            tools = _llm_extract_tools_from_source(
-                text, source_id=art["source_id"], source_url=art["url"]
-            )
-            all_mentions.extend(tools)
-        except Exception:
-            log.exception("Failed to extract tools from article: %s", art["url"])
-        time.sleep(2)  # rate-limit spacing
 
-    # --- Process emails (group by source_id, process each email) ---
-    total_email = len(emails)
-    for i, email in enumerate(emails):
-        log.info("LLM extraction: email %d/%d [%s] %s",
-                 i + 1, total_email, email["source_id"], email["subject"][:50])
-        text = (
-            f"Subject: {email['subject']}\nDate: {email['date']}\n"
-            f"Sender: {email['sender']}\nContent:\n{email['body']}"
-        )
-        try:
-            tools = _llm_extract_tools_from_source(
-                text, source_id=email["source_id"], source_url=f"email://{email['sender']}"
-            )
-            all_mentions.extend(tools)
-        except Exception:
-            log.exception("Failed to extract tools from email: %s", email["subject"])
-        time.sleep(2)
+        for ci, chunk in enumerate(batch["text_chunks"]):
+            log.info("  chunk %d/%d for '%s' (%d chars)",
+                     ci + 1, len(batch["text_chunks"]), source_id, len(chunk))
+            try:
+                raw_tools = _llm_extract_tools_from_chunk(chunk)
+                # Attach source metadata
+                for tool in raw_tools:
+                    tool["source_id"] = source_id
+                    tool["source_url"] = source_url
+                all_mentions.extend(raw_tools)
+                log.info("    -> extracted %d tool mention(s)", len(raw_tools))
+            except Exception:
+                log.exception("  Failed to extract from chunk %d of '%s'", ci + 1, source_id)
 
-    log.info("Total raw tool mentions extracted: %d", len(all_mentions))
+            call_count += 1
+            time.sleep(RATE_LIMIT_SLEEP)
+
+    log.info("Total raw tool mentions extracted: %d (in %d LLM calls)", len(all_mentions), call_count)
 
     # --- Deterministic counting ---
     ranked_tools, mention_details = _deterministic_rank(all_mentions)
@@ -495,7 +571,7 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
 
     # --- LLM categorisation using the deterministic ranked data ---
     log.info("Sending ranked data to LLM for analysis & categorisation …")
-    time.sleep(2)
+    time.sleep(RATE_LIMIT_SLEEP)
     final = _llm_analyze_ranked(ranked_tools, mention_details)
 
     return final
@@ -599,7 +675,7 @@ def _llm_analyze_ranked(ranked_tools: list[dict], mention_details: list[dict]) -
     # --- Call 1: Tools Log ---
     log.info("LLM tools_log categorisation pass …")
     tools_log = _llm_tools_log_from_ranked(ranked_summary)
-    time.sleep(15)
+    time.sleep(RATE_LIMIT_SLEEP)
 
     # --- Call 2: Field Tools ---
     log.info("LLM field_tools categorisation pass …")
