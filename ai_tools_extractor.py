@@ -547,17 +547,22 @@ def _deterministic_rank(all_mentions: list[dict]) -> tuple[list[dict], list[dict
         if mention.get("source_url"):
             entry["source_urls"].append(mention["source_url"])
 
-    # Build ranked list
+    # Build ranked list — include ALL extracted descriptions and use_cases
+    # so the LLM categorisation is driven by actual source content
     ranked = []
     for key, entry in tool_data.items():
+        # Deduplicate descriptions and use_cases while preserving order
+        unique_descriptions = list(dict.fromkeys(d for d in entry["descriptions"] if d))
+        unique_use_cases = list(dict.fromkeys(u for u in entry["use_cases"] if u))
+
         ranked.append({
             "tool_name": entry["tool_name"],
             "positive_source_count": len(entry["positive_sources"]),
             "total_source_count": len(entry["all_sources"]),
             "positive_sources": sorted(entry["positive_sources"]),
             "all_sources": sorted(entry["all_sources"]),
-            "description": entry["descriptions"][0] if entry["descriptions"] else "",
-            "use_case": entry["use_cases"][0] if entry["use_cases"] else "",
+            "descriptions": unique_descriptions,
+            "use_cases": unique_use_cases,
             "sample_source_urls": list(dict.fromkeys(entry["source_urls"]))[:5],
         })
 
@@ -570,15 +575,16 @@ def _deterministic_rank(all_mentions: list[dict]) -> tuple[list[dict], list[dict
 # ===================================================================
 # 6. LLM Analysis & Categorisation (using deterministic ranked data)
 # ===================================================================
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
 def _llm_analyze_ranked(ranked_tools: list[dict], mention_details: list[dict]) -> dict:
     """Send the deterministically-ranked tools to the LLM for categorisation.
 
-    The LLM receives the ranked data and produces:
+    The LLM receives the ranked data (including ALL extracted descriptions and
+    use_cases from source content) and produces:
     1. tools_log: top 25 tools with category and analysis
     2. field_tools: top 5 tools per category
     """
-    # Prepare concise ranked summary for the LLM
+    # Prepare ranked summary for the LLM — include all extracted content
+    # so categorisation is driven by what sources actually said
     ranked_summary = []
     for t in ranked_tools[:50]:  # send top 50 to LLM for analysis
         ranked_summary.append({
@@ -586,8 +592,8 @@ def _llm_analyze_ranked(ranked_tools: list[dict], mention_details: list[dict]) -
             "positive_mentions_across_sources": t["positive_source_count"],
             "total_sources_mentioned": t["total_source_count"],
             "sources": t["positive_sources"],
-            "description": t["description"],
-            "use_case": t["use_case"],
+            "descriptions_from_sources": t["descriptions"],
+            "use_cases_from_sources": t["use_cases"],
         })
 
     # --- Call 1: Tools Log ---
@@ -613,10 +619,17 @@ def _llm_tools_log_from_ranked(ranked_summary: list[dict]) -> list:
         DETERMINISTIC and MUST be preserved exactly in your output as the
         "mentions" field.
 
+        Each tool includes "descriptions_from_sources" and "use_cases_from_sources"
+        — these are the actual descriptions and use-cases extracted from the
+        newsletter content. You MUST base your categorisation and description
+        on this extracted content, NOT on your own knowledge of the tool.
+
         Your job is to:
-        1. Assign each tool to one of the categories below.
-        2. Write a 1-sentence description.
-        3. Provide the tool's own website URL (not the newsletter URL).
+        1. Read the extracted descriptions and use-cases for each tool.
+        2. Based on that content, assign the tool to the single best-fitting
+           category from the list below.
+        3. Synthesise the extracted descriptions into 1 sentence.
+        4. Provide the tool's own website URL.
 
         CATEGORIES:
         {categories_str}
@@ -627,7 +640,7 @@ def _llm_tools_log_from_ranked(ranked_summary: list[dict]) -> list:
             "tool_name": "...",
             "category": "<one of the categories above>",
             "mentions": <int — MUST equal positive_mentions_across_sources>,
-            "description": "1 sentence.",
+            "description": "1 sentence synthesised from extracted descriptions.",
             "source_link": "https://tool-website.com"
           }}
         ]
@@ -637,6 +650,9 @@ def _llm_tools_log_from_ranked(ranked_summary: list[dict]) -> list:
         - "mentions" MUST exactly match the "positive_mentions_across_sources"
           value from the input. Do NOT re-count or estimate.
         - Keep tools sorted by mentions descending.
+        - "category" MUST be chosen based on the extracted use_cases_from_sources
+          and descriptions_from_sources, NOT your general knowledge.
+        - "description" MUST summarise what the sources said, not your own knowledge.
         - "source_link" = the tool's own website, NOT the newsletter URL.
 
         RANKED TOOLS DATA:
@@ -664,8 +680,17 @@ def _llm_field_tools_from_ranked(ranked_summary: list[dict]) -> list:
 
     prompt = textwrap.dedent(f"""\
         Below are AI tools ranked by how many independent sources mentioned
-        them positively. Use this data to select the top 5 tools for each
-        of the 12 categories below.
+        them positively. Each tool includes "descriptions_from_sources" and
+        "use_cases_from_sources" — these are the actual descriptions and
+        use-cases extracted from the newsletter content.
+
+        Your job: for EACH of the 12 categories below, select the top 5 tools
+        whose EXTRACTED use-cases and descriptions best fit that category.
+
+        IMPORTANT: Assign tools to categories based ONLY on the extracted
+        "use_cases_from_sources" and "descriptions_from_sources" content.
+        Do NOT rely on your general knowledge of what a tool can do — only
+        what the newsletter sources actually described.
 
         CATEGORIES:
         {categories_str}
@@ -676,17 +701,21 @@ def _llm_field_tools_from_ranked(ranked_summary: list[dict]) -> list:
             "field": "<category name>",
             "rank": <1-5>,
             "tool_name": "...",
-            "why_recommended": "1 sentence.",
+            "why_recommended": "1 sentence based on extracted use-cases.",
             "url": "https://tool-website.com"
           }}
         ]
 
         RULES:
-        - rank 1 = best in category (most positively mentioned + most relevant).
-        - If fewer than 5 tools exist for a category, include as many as possible.
+        - rank 1 = best in category (most relevant extracted use-cases +
+          highest positive_mentions_across_sources count).
+        - If fewer than 5 tools fit a category based on extracted content,
+          include only those that actually fit.
         - "url" = the tool's own website.
-        - "why_recommended" = 1 sentence max.
-        - Prefer tools with higher positive_mentions_across_sources counts.
+        - "why_recommended" = 1 sentence summarising the extracted use-case,
+          NOT your own knowledge.
+        - Prefer tools with higher positive_mentions_across_sources counts
+          when relevance is similar.
 
         RANKED TOOLS DATA:
         {json.dumps(ranked_summary, indent=2)}
