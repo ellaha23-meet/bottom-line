@@ -414,9 +414,10 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
 
     # Deterministic counting: count how many times each tool is mentioned
     ranked_tools = _deterministic_count_and_rank(all_extracted)
-    log.info("Deterministic ranking complete: %d unique tools found.", len(ranked_tools))
+    log.info("Deterministic ranking complete: %d unique tools found across %d sources.",
+             len(ranked_tools), total_sources)
     for t in ranked_tools[:10]:
-        log.info("  %s — %d mentions", t["tool_name"], t["mentions"])
+        log.info("  %s — mentioned in %d sources", t["tool_name"], t["mentions"])
 
     # Phase 2: send ranked list to LLM for categorisation & description
     log.info("LLM categorisation pass …")
@@ -506,15 +507,15 @@ def _normalize_tool_name(name: str) -> str:
 
 
 def _deterministic_count_and_rank(all_mentions: list[dict]) -> list[dict]:
-    """Deterministically count and rank tools by total mentions.
+    """Deterministically count and rank tools by mentions across sources.
 
-    Each entry in *all_mentions* represents one individual mention of a tool
-    from one source.  We normalise names, count occurrences, collect all
-    use_cases, and return a list sorted by mention count descending.
+    "Mentions" = how many distinct sources (articles / emails) mention the
+    tool.  We deduplicate by ``(normalised_tool_name, source_id)`` so that a
+    tool mentioned 5 times *within* one article still counts as 1 mention
+    from that source, while mentions from different sources each count
+    separately.  The result is sorted by mention count descending.
     """
-    # Count mentions per normalised tool name
-    counts: dict[str, int] = collections.Counter()
-    # Track original-case names and metadata per normalised key
+    # Group all entries by normalised tool name
     meta: dict[str, list[dict]] = collections.defaultdict(list)
 
     for m in all_mentions:
@@ -522,15 +523,22 @@ def _deterministic_count_and_rank(all_mentions: list[dict]) -> list[dict]:
         if not name:
             continue
         key = _normalize_tool_name(name)
-        counts[key] += 1
         meta[key].append(m)
 
-    # Build ranked list
+    # Build ranked list — count *unique source_ids* per tool
     ranked: list[dict] = []
-    for key, count in counts.most_common():
-        entries = meta[key]
+    for key, entries in meta.items():
+        # Count distinct sources that mention this tool
+        source_ids = {
+            e.get("source_id", "").strip() or f"_unknown_{i}"
+            for i, e in enumerate(entries)
+        }
+        mention_count = len(source_ids)
+
         # Pick the most common original-case spelling
-        name_counter = collections.Counter(e.get("tool_name", "").strip() for e in entries)
+        name_counter = collections.Counter(
+            e.get("tool_name", "").strip() for e in entries
+        )
         best_name = name_counter.most_common(1)[0][0]
         # Pick the first non-N/A source_url
         source_url = "N/A"
@@ -553,12 +561,14 @@ def _deterministic_count_and_rank(all_mentions: list[dict]) -> list[dict]:
         ))
         ranked.append({
             "tool_name": best_name,
-            "mentions": count,
+            "mentions": mention_count,
             "description": best_desc,
             "source_url": source_url,
             "use_cases": use_cases,
         })
 
+    # Sort by mention count descending, then alphabetically for ties
+    ranked.sort(key=lambda t: (-t["mentions"], t["tool_name"]))
     return ranked
 
 
