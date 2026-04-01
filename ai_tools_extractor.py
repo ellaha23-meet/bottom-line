@@ -468,7 +468,11 @@ def _llm_extract_tools(text_chunk: str) -> str:
             - "source_id": the SOURCE_ID the tool was found in (copy exactly)
             - "tool_name": the tool/product name (use official casing)
             - "sentiment": "positive", "neutral", or "negative"
-            - "description": 1 sentence about the tool
+            - "description": 1 sentence about what the tool IS
+            - "use_case": 1 sentence about HOW the source says the tool
+              is used or what task/problem it helps with. Quote or
+              closely paraphrase the source. If no specific use case is
+              described, write "General mention".
             - "source_url": the tool's URL if mentioned, else "N/A"
 
             CRITICAL RULES:
@@ -563,10 +567,19 @@ def _parse_and_count_mentions(raw_mentions: list[str]) -> list[dict]:
                 or "N/A"
             )
 
+            use_case = (
+                entry.get("use_case") or entry.get("Use Case") or ""
+            ).strip()
+
             if key not in tool_meta:
-                tool_meta[key] = {"display_name": name, "descs": [], "urls": []}
+                tool_meta[key] = {
+                    "display_name": name, "descs": [], "urls": [],
+                    "use_cases": [],
+                }
             if desc:
                 tool_meta[key]["descs"].append(desc.strip())
+            if use_case and use_case.lower() != "general mention":
+                tool_meta[key]["use_cases"].append(use_case)
             if url and url != "N/A":
                 tool_meta[key]["urls"].append(url.strip())
 
@@ -583,6 +596,7 @@ def _parse_and_count_mentions(raw_mentions: list[str]) -> list[dict]:
             "positive_mentions": pos_count,
             "total_mentions": total_count,
             "descriptions": list(dict.fromkeys(info.get("descs", [])))[:3],
+            "use_cases": list(dict.fromkeys(info.get("use_cases", []))),
             "source_urls": list(dict.fromkeys(info.get("urls", []))),
         })
 
@@ -634,6 +648,7 @@ def _llm_tools_log(pre_ranked: list[dict]) -> list:
                 "positive_mentions": t["positive_mentions"],
                 "total_mentions": t["total_mentions"],
                 "sample_descriptions": t["descriptions"],
+                "use_cases_from_sources": t["use_cases"],
                 "source_urls": t["source_urls"],
             }
             for t in pre_ranked
@@ -648,7 +663,11 @@ def _llm_tools_log(pre_ranked: list[dict]) -> list:
 
         For each tool, add:
         - "category": a short category label (e.g. "LLM", "Image Generation").
-        - "description": a polished 1-sentence description.
+          IMPORTANT: base the category on the "use_cases_from_sources" field —
+          this shows how real newsletter articles described the tool being used.
+          Do NOT guess from the tool name alone.
+        - "description": a polished 1-sentence description based on the
+          source descriptions and use cases provided.
         - "source_link": the tool's own website URL (not the newsletter).
           Use the source_urls provided when available; otherwise infer the
           official URL.
@@ -710,6 +729,7 @@ def _llm_field_tools(pre_ranked: list[dict]) -> list:
                 "positive_mentions": t["positive_mentions"],
                 "total_mentions": t["total_mentions"],
                 "sample_descriptions": t["descriptions"],
+                "use_cases_from_sources": t["use_cases"],
                 "source_urls": t["source_urls"],
             }
             for t in pre_ranked
@@ -720,8 +740,13 @@ def _llm_field_tools(pre_ranked: list[dict]) -> list:
     prompt = textwrap.dedent(f"""\
         Below is a verified list of AI tools extracted from newsletter sources,
         ranked by number of source mentions.
+
+        Each tool includes "use_cases_from_sources" — these are real quotes /
+        paraphrases from newsletter articles describing HOW the tool is used.
+        Use these to decide which category each tool fits into.
+
         For EACH of the categories below, pick the top 5 tools from this list
-        that best fit the category and rank them 1-5.
+        that best fit the category based on their USE CASES, and rank them 1-5.
 
         CATEGORIES:
         {categories_str}
@@ -735,7 +760,7 @@ def _llm_field_tools(pre_ranked: list[dict]) -> list:
             "field": "<category name>",
             "rank": <1-5>,
             "tool_name": "...",
-            "why_recommended": "1 sentence.",
+            "why_recommended": "1 sentence based on actual use cases from the sources.",
             "url": "https://..."
           }}
         ]
@@ -743,9 +768,11 @@ def _llm_field_tools(pre_ranked: list[dict]) -> list:
         RULES:
         - rank 1 = best in category.
         - ONLY use tools from the VERIFIED TOOLS list above — do NOT invent tools.
+        - Assign tools to categories based on their use_cases_from_sources,
+          NOT based on what you generally know about the tool.
+        - "why_recommended" must reference how the sources described the tool.
         - If fewer than 5 tools exist for a category, include as many as possible.
         - "url" = the tool's own website.
-        - "why_recommended" = 1 sentence max.
     """)
 
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
