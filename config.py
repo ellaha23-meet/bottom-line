@@ -3,7 +3,7 @@ Configuration constants for the AI Tools Extraction pipeline.
 """
 
 # ---------------------------------------------------------------------------
-# Archive URLs to scrape (last 14 days of content)
+# Archive URLs to scrape (newsletter website sources)
 # ---------------------------------------------------------------------------
 ARCHIVE_URLS = [
     "https://www.superhuman.ai/archive",
@@ -13,6 +13,22 @@ ARCHIVE_URLS = [
     "https://www.bensbites.com/archive",
     "https://importai.substack.com/archive",
 ]
+
+# ---------------------------------------------------------------------------
+# Known email newsletter providers (used as source_id for email sources)
+# Map from sender address → human-readable source ID
+# ---------------------------------------------------------------------------
+EMAIL_PROVIDERS = {
+    "bensbites@substack.com": "bensbites_email",
+    "importai@substack.com": "importai_email",
+    "news+canned.response@daily.therundown.ai": "therundown_email",
+    "news@alphasignal.ai": "alphasignal_email",
+    "dan@tldrnewsletter.com": "tldr_email",
+    "hi@mail.theresanaiforthat.com": "theresanaiforthat_email",
+    "theneuron@newsletter.theneurondaily.com": "theneuron_email",
+    "superhuman@mail.joinsuperhuman.ai": "superhuman_email",
+    "hello@mindstream.news": "mindstream_email",
+}
 
 # ---------------------------------------------------------------------------
 # Gmail label to fetch newsletters from

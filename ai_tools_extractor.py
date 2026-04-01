@@ -2,8 +2,9 @@
 """
 AI Tools Extraction Pipeline
 =============================
-Scrapes AI newsletter archives and Gmail, uses an LLM to extract / rank /
-categorise AI tools, and writes the results to Google Sheets.
+Scrapes AI newsletter archives and Gmail, uses an LLM to extract AI tools
+from each source independently, deterministically counts positive mentions
+across sources, and uses an LLM to analyse and categorise the ranked results.
 
 Usage:
     1. Place your Google OAuth `credentials.json` in the project root.
@@ -19,6 +20,7 @@ import os
 import re
 import textwrap
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
@@ -58,11 +60,7 @@ SCOPES = [
 # 1. Google Authentication
 # ===================================================================
 def get_google_credentials() -> Credentials:
-    """Authenticate with Google using OAuth2 and return credentials.
-
-    Looks for a cached token in ``token.json``; if absent or expired,
-    opens the browser-based OAuth consent flow using ``credentials.json``.
-    """
+    """Authenticate with Google using OAuth2 and return credentials."""
     creds = None
     if os.path.exists("token.json"):
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
@@ -86,10 +84,37 @@ def get_google_credentials() -> Credentials:
 # ===================================================================
 # 2. Gmail Fetching
 # ===================================================================
+def _extract_sender_email(from_header: str) -> str:
+    """Extract the bare email address from a From header value."""
+    match = re.search(r"<([^>]+)>", from_header)
+    if match:
+        return match.group(1).lower().strip()
+    return from_header.lower().strip()
+
+
+def _map_sender_to_source_id(sender: str) -> str:
+    """Map a sender email address to a known source_id.
+
+    Checks exact match first, then falls back to domain-based matching.
+    Returns the sender address itself if no known provider matches.
+    """
+    if sender in config.EMAIL_PROVIDERS:
+        return config.EMAIL_PROVIDERS[sender]
+
+    # Fuzzy match on domain parts
+    for known_addr, source_id in config.EMAIL_PROVIDERS.items():
+        known_domain = known_addr.split("@")[-1]
+        sender_domain = sender.split("@")[-1]
+        if known_domain == sender_domain:
+            return source_id
+
+    return f"email_{sender}"
+
+
 def fetch_emails(creds: Credentials) -> list[dict]:
     """Fetch emails from Gmail with the configured newsletter label.
 
-    Returns a list of dicts: ``{"subject": ..., "date": ..., "body": ...}``.
+    Returns a list of dicts with keys: subject, date, body, source_id, sender.
     Only emails from the last ``config.LOOKBACK_DAYS`` days are returned.
     """
     service = build("gmail", "v1", credentials=creds)
@@ -137,10 +162,14 @@ def fetch_emails(creds: Credentials) -> list[dict]:
         )
         headers = {h["name"]: h["value"] for h in msg["payload"].get("headers", [])}
         body_text = _extract_email_body(msg["payload"])
+        sender = _extract_sender_email(headers.get("From", ""))
+        source_id = _map_sender_to_source_id(sender)
         results.append({
             "subject": headers.get("Subject", ""),
             "date": headers.get("Date", ""),
             "body": body_text,
+            "sender": sender,
+            "source_id": source_id,
         })
 
     return results
@@ -175,6 +204,11 @@ def _extract_email_body(payload: dict) -> str:
 # ===================================================================
 # 3. Web Archive Scraping
 # ===================================================================
+def _archive_url_to_source_id(archive_url: str) -> str:
+    """Derive a source_id from an archive URL (e.g. 'superhuman.ai')."""
+    return archive_url.split("/")[2].replace("www.", "")
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def _fetch_page(url: str, page) -> str:
     """Navigate to a URL with Playwright and return the fully-rendered HTML."""
@@ -183,10 +217,9 @@ def _fetch_page(url: str, page) -> str:
 
 
 def scrape_archives() -> list[dict]:
-    """Scrape all configured archive URLs for posts from the last 14 days.
+    """Scrape all configured archive URLs for posts from the lookback window.
 
-    Returns a list of dicts: ``{"source": ..., "title": ..., "date": ...,
-    "url": ..., "content": ...}``.
+    Returns a list of dicts with keys: source, source_id, title, date, url, content.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=config.LOOKBACK_DAYS)
     all_articles: list[dict] = []
@@ -224,6 +257,8 @@ def scrape_archives() -> list[dict]:
 
 def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dict]:
     """Parse an archive page and fetch individual article content."""
+    source_id = _archive_url_to_source_id(archive_url)
+
     # Navigate to the archive page
     try:
         page.goto(archive_url, wait_until="networkidle", timeout=config.REQUEST_TIMEOUT * 1000)
@@ -232,39 +267,38 @@ def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dic
 
     # Scroll down repeatedly to trigger infinite scroll and load all articles
     prev_height = 0
-    for _ in range(30):  # up to 30 scrolls (~30 days of articles)
+    for _ in range(30):
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(2000)  # wait 2s for new content to load
+        page.wait_for_timeout(2000)
         new_height = page.evaluate("document.body.scrollHeight")
         if new_height == prev_height:
-            break  # no more content loading
+            break
         prev_height = new_height
 
     html = page.content()
 
-    # Save rendered HTML for debugging (first archive only)
+    # Save rendered HTML for debugging
     debug_file = f"debug_{archive_url.split('/')[2]}.html"
     with open(debug_file, "w", encoding="utf-8") as f:
         f.write(html)
     log.info("  -> saved rendered HTML to %s", debug_file)
 
     soup = BeautifulSoup(html, "html.parser")
-    articles: list[dict] = []
 
     link_candidates = _find_article_links(soup, archive_url)
     log.info("  -> found %d link candidates on archive page", len(link_candidates))
     for title, url, date_str in link_candidates[:5]:
         log.info("     sample: [%s] %s (%s)", date_str, title[:60], url[:80])
 
+    articles: list[dict] = []
     for title, url, date_str in link_candidates[: config.MAX_ARTICLES_PER_SOURCE]:
         pub_date = _parse_date_safe(date_str)
         if pub_date and pub_date < cutoff:
-            continue  # older than 14 days — skip
+            continue
 
         try:
             page_html = _fetch_page(url, page)
             page_soup = BeautifulSoup(page_html, "html.parser")
-            # Try <article>, then main, then body
             article_tag = (
                 page_soup.find("article")
                 or page_soup.find("main")
@@ -273,14 +307,15 @@ def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dic
             content = article_tag.get_text(separator="\n", strip=True) if article_tag else ""
         except Exception:
             log.warning("Could not fetch article: %s", url)
-            content = title  # fall back to just the title
+            content = title
 
         articles.append({
             "source": archive_url,
+            "source_id": source_id,
             "title": title,
             "date": date_str,
             "url": url,
-            "content": content[:8000],  # cap to avoid token explosion
+            "content": content[:8000],
         })
 
     return articles
@@ -288,21 +323,20 @@ def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dic
 
 def _find_article_links(soup: BeautifulSoup, archive_url: str) -> list[tuple[str, str, str]]:
     """Heuristically extract (title, url, date_string) tuples from an archive page."""
-    base = "/".join(archive_url.split("/")[:3])  # scheme + host
+    base = "/".join(archive_url.split("/")[:3])
     results: list[tuple[str, str, str]] = []
 
-    # Strategy 1: Substack-style archives (<a class="post-preview-title"> or similar)
+    # Strategy 1: Substack-style archives
     for a_tag in soup.select("a[data-post-id], a.post-preview-title, a.post-preview"):
         href = a_tag.get("href", "")
         if not href.startswith("http"):
             href = base + href
         title = a_tag.get_text(strip=True)
-        # Look for a sibling/parent time tag
         date_str = _find_nearby_date(a_tag)
         if title:
             results.append((title, href, date_str))
 
-    # Strategy 2: Generic — any <a> whose href contains "/p/" or "/post/" or "/newsletter/"
+    # Strategy 2: Generic — /p/ /post/ /newsletter/ /i/ links
     if not results:
         for a_tag in soup.find_all("a", href=True):
             href = a_tag["href"]
@@ -314,13 +348,12 @@ def _find_article_links(soup: BeautifulSoup, archive_url: str) -> list[tuple[str
                 if title and href not in [r[1] for r in results]:
                     results.append((title, href, date_str))
 
-    # Strategy 3: Broad fallback — grab all links that look like articles
+    # Strategy 3: Broad fallback
     if not results:
         for a_tag in soup.find_all("a", href=True):
             href = a_tag["href"]
             if not href.startswith("http"):
                 href = base + href
-            # Skip navigation / footer links
             if any(skip in href for skip in ["#", "javascript:", "/archive", "/login", "/subscribe"]):
                 continue
             title = a_tag.get_text(strip=True)
@@ -333,7 +366,6 @@ def _find_article_links(soup: BeautifulSoup, archive_url: str) -> list[tuple[str
 
 def _find_nearby_date(tag) -> str:
     """Search parent/sibling elements for a <time> tag or date-like text."""
-    # Check for <time> in parent containers (up 3 levels)
     parent = tag
     for _ in range(4):
         if parent is None:
@@ -359,115 +391,256 @@ def _parse_date_safe(date_str: str) -> datetime | None:
 
 
 # ===================================================================
-# 4. LLM Analysis
+# 4. LLM-Based Per-Source Tool Extraction
 # ===================================================================
-def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
-    """Send collected content to the LLM and return structured tool data.
-
-    Returns a dict with keys ``"tools_log"`` and ``"field_tools"``.
-    """
-    # Build a combined text digest for the LLM
-    digest_parts: list[str] = []
-
-    for art in articles:
-        digest_parts.append(
-            f"[Source: {art['source']}]\nTitle: {art['title']}\n"
-            f"Date: {art['date']}\nURL: {art['url']}\n"
-            f"Content:\n{art['content']}\n{'---'}\n"
-        )
-
-    for email in emails:
-        digest_parts.append(
-            f"[Source: Gmail / {config.GMAIL_LABEL}]\n"
-            f"Subject: {email['subject']}\nDate: {email['date']}\n"
-            f"Content:\n{email['body'][:6000]}\n{'---'}\n"
-        )
-
-    # Split into chunks for the LLM (≈800 000 chars ≈ 200k tokens, fits in 1-2 chunks)
-    chunks = _chunk_text("\n".join(digest_parts), max_chars=800_000)
-
-    # Phase 1: extract raw tool mentions from each chunk
-    raw_mentions: list[str] = []
-    for i, chunk in enumerate(chunks):
-        log.info("LLM extraction pass %d/%d …", i + 1, len(chunks))
-        raw_mentions.append(_llm_extract_tools(chunk))
-        if i < len(chunks) - 1:
-            time.sleep(15)  # 5 RPM limit: wait 15s between chunks
-
-    # Phase 2: aggregate, rank, and categorise
-    combined_mentions = "\n\n".join(raw_mentions)
-    log.info("LLM ranking & categorisation pass …")
-    time.sleep(15)  # wait before ranking call to respect rate limit
-    final_json = _llm_rank_and_categorise(combined_mentions)
-
-    return final_json
-
-
-def _chunk_text(text: str, max_chars: int) -> list[str]:
-    """Split text into chunks of approximately max_chars."""
-    if len(text) <= max_chars:
-        return [text]
-    chunks, start = [], 0
-    while start < len(text):
-        end = start + max_chars
-        # Try to split at a paragraph boundary
-        boundary = text.rfind("\n---\n", start, end)
-        if boundary > start:
-            end = boundary + 5
-        chunks.append(text[start:end])
-        start = end
-    return chunks
-
-
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
-def _llm_extract_tools(text_chunk: str) -> str:
-    """Ask the LLM to list AI tools mentioned in a text chunk."""
+def _llm_extract_tools_from_source(text: str, source_id: str, source_url: str) -> list[dict]:
+    """Ask the LLM to extract AI tools from a single source's content.
+
+    Returns a list of dicts with keys:
+        source_id, tool_name, sentiment, description, use_case, source_url
+    """
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
     model = genai.GenerativeModel(
         model_name=config.LLM_MODEL,
         system_instruction=textwrap.dedent("""\
-            You are an AI-tools analyst. Given newsletter content, extract
-            every AI tool mentioned. For each tool output:
-            - Tool Name
-            - Sentiment (positive / neutral / negative)
-            - Short description (1 sentence)
-            - Source URL of the tool (if mentioned, else "N/A")
-            Return the results as a JSON array of objects.
+            You are an AI-tools analyst. Given a single newsletter article or
+            email, extract every distinct AI tool mentioned. For each tool return
+            a JSON object with these exact keys:
+            - "tool_name": the canonical name of the tool
+            - "sentiment": one of "positive", "neutral", or "negative"
+            - "description": 1-sentence description of the tool
+            - "use_case": 1-sentence description of the primary use-case mentioned
+
+            Return ONLY a valid JSON array. No markdown fences, no commentary.
+            If no AI tools are mentioned, return an empty array [].
         """),
         generation_config=genai.GenerationConfig(
             max_output_tokens=config.LLM_MAX_TOKENS,
-            temperature=0.2,
+            temperature=0.1,
+            response_mime_type="application/json",
         ),
     )
-    response = model.generate_content(text_chunk)
-    return response.text
+    response = model.generate_content(text[:30000])  # cap per-source input
+    raw_tools = json.loads(response.text)
+
+    # Attach source metadata to each extracted tool
+    for tool in raw_tools:
+        tool["source_id"] = source_id
+        tool["source_url"] = source_url
+
+    return raw_tools
+
+
+# ===================================================================
+# 5. Deterministic Counting & Ranking
+# ===================================================================
+def _normalize_tool_name(name: str) -> str:
+    """Normalize a tool name for deduplication (lowercase, strip whitespace)."""
+    return re.sub(r"\s+", " ", name.strip().lower())
+
+
+def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
+    """Extract tools per-source, deterministically count cross-source mentions,
+    then send ranked data to the LLM for categorisation.
+
+    Returns a dict with keys ``"tools_log"`` and ``"field_tools"``.
+    """
+    all_mentions: list[dict] = []
+
+    # --- Process web archive articles ---
+    total_web = len(articles)
+    for i, art in enumerate(articles):
+        log.info("LLM extraction: web article %d/%d [%s] %s",
+                 i + 1, total_web, art["source_id"], art["title"][:50])
+        text = (
+            f"Title: {art['title']}\nDate: {art['date']}\n"
+            f"URL: {art['url']}\nContent:\n{art['content']}"
+        )
+        try:
+            tools = _llm_extract_tools_from_source(
+                text, source_id=art["source_id"], source_url=art["url"]
+            )
+            all_mentions.extend(tools)
+        except Exception:
+            log.exception("Failed to extract tools from article: %s", art["url"])
+        time.sleep(2)  # rate-limit spacing
+
+    # --- Process emails (group by source_id, process each email) ---
+    total_email = len(emails)
+    for i, email in enumerate(emails):
+        log.info("LLM extraction: email %d/%d [%s] %s",
+                 i + 1, total_email, email["source_id"], email["subject"][:50])
+        text = (
+            f"Subject: {email['subject']}\nDate: {email['date']}\n"
+            f"Sender: {email['sender']}\nContent:\n{email['body']}"
+        )
+        try:
+            tools = _llm_extract_tools_from_source(
+                text, source_id=email["source_id"], source_url=f"email://{email['sender']}"
+            )
+            all_mentions.extend(tools)
+        except Exception:
+            log.exception("Failed to extract tools from email: %s", email["subject"])
+        time.sleep(2)
+
+    log.info("Total raw tool mentions extracted: %d", len(all_mentions))
+
+    # --- Deterministic counting ---
+    ranked_tools, mention_details = _deterministic_rank(all_mentions)
+
+    log.info("Unique tools found: %d", len(ranked_tools))
+    for t in ranked_tools[:10]:
+        log.info("  %s: %d positive source(s)", t["tool_name"], t["positive_source_count"])
+
+    # --- LLM categorisation using the deterministic ranked data ---
+    log.info("Sending ranked data to LLM for analysis & categorisation …")
+    time.sleep(2)
+    final = _llm_analyze_ranked(ranked_tools, mention_details)
+
+    return final
+
+
+def _deterministic_rank(all_mentions: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Deterministically count positive mentions per tool across unique sources.
+
+    Returns:
+        ranked_tools: list of dicts sorted by positive_source_count descending.
+            Each dict has: tool_name, positive_source_count, sources, description, use_case
+        mention_details: the full list of per-source mentions (the raw JSON).
+    """
+    # Group mentions by normalized tool name
+    tool_data: dict[str, dict] = defaultdict(lambda: {
+        "tool_name": "",
+        "positive_sources": set(),
+        "all_sources": set(),
+        "descriptions": [],
+        "use_cases": [],
+        "source_urls": [],
+        "sentiments": [],
+    })
+
+    for mention in all_mentions:
+        name = mention.get("tool_name", "").strip()
+        if not name:
+            continue
+        key = _normalize_tool_name(name)
+        entry = tool_data[key]
+
+        # Keep the most common casing (use first seen)
+        if not entry["tool_name"]:
+            entry["tool_name"] = name
+
+        source_id = mention.get("source_id", "unknown")
+        sentiment = mention.get("sentiment", "neutral").lower().strip()
+
+        entry["all_sources"].add(source_id)
+        entry["sentiments"].append(sentiment)
+
+        if sentiment == "positive":
+            entry["positive_sources"].add(source_id)
+
+        if mention.get("description"):
+            entry["descriptions"].append(mention["description"])
+        if mention.get("use_case"):
+            entry["use_cases"].append(mention["use_case"])
+        if mention.get("source_url"):
+            entry["source_urls"].append(mention["source_url"])
+
+    # Build ranked list
+    ranked = []
+    for key, entry in tool_data.items():
+        ranked.append({
+            "tool_name": entry["tool_name"],
+            "positive_source_count": len(entry["positive_sources"]),
+            "total_source_count": len(entry["all_sources"]),
+            "positive_sources": sorted(entry["positive_sources"]),
+            "all_sources": sorted(entry["all_sources"]),
+            "description": entry["descriptions"][0] if entry["descriptions"] else "",
+            "use_case": entry["use_cases"][0] if entry["use_cases"] else "",
+            "sample_source_urls": list(dict.fromkeys(entry["source_urls"]))[:5],
+        })
+
+    # Sort by positive_source_count descending, then by total_source_count
+    ranked.sort(key=lambda x: (-x["positive_source_count"], -x["total_source_count"]))
+
+    return ranked, all_mentions
+
+
+# ===================================================================
+# 6. LLM Analysis & Categorisation (using deterministic ranked data)
+# ===================================================================
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
+def _llm_analyze_ranked(ranked_tools: list[dict], mention_details: list[dict]) -> dict:
+    """Send the deterministically-ranked tools to the LLM for categorisation.
+
+    The LLM receives the ranked data and produces:
+    1. tools_log: top 25 tools with category and analysis
+    2. field_tools: top 5 tools per category
+    """
+    # Prepare concise ranked summary for the LLM
+    ranked_summary = []
+    for t in ranked_tools[:50]:  # send top 50 to LLM for analysis
+        ranked_summary.append({
+            "tool_name": t["tool_name"],
+            "positive_mentions_across_sources": t["positive_source_count"],
+            "total_sources_mentioned": t["total_source_count"],
+            "sources": t["positive_sources"],
+            "description": t["description"],
+            "use_case": t["use_case"],
+        })
+
+    # --- Call 1: Tools Log ---
+    log.info("LLM tools_log categorisation pass …")
+    tools_log = _llm_tools_log_from_ranked(ranked_summary)
+    time.sleep(15)
+
+    # --- Call 2: Field Tools ---
+    log.info("LLM field_tools categorisation pass …")
+    field_tools = _llm_field_tools_from_ranked(ranked_summary)
+
+    return {"tools_log": tools_log, "field_tools": field_tools}
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
-def _llm_tools_log(mentions_text: str) -> list:
-    """Ask the LLM for the top 25 tools ranked by mentions."""
+def _llm_tools_log_from_ranked(ranked_summary: list[dict]) -> list:
+    """Ask the LLM to categorise and describe the top-ranked tools."""
+    categories_str = "\n".join(f"- {c}" for c in config.CATEGORIES)
+
     prompt = textwrap.dedent(f"""\
-        Below are AI tool mentions extracted from multiple newsletter sources.
-        Return a JSON array of the top 25 tools sorted by positive mentions (descending).
+        Below are AI tools ranked by how many independent sources mentioned
+        them positively. The "positive_mentions_across_sources" count is
+        DETERMINISTIC and MUST be preserved exactly in your output as the
+        "mentions" field.
+
+        Your job is to:
+        1. Assign each tool to one of the categories below.
+        2. Write a 1-sentence description.
+        3. Provide the tool's own website URL (not the newsletter URL).
+
+        CATEGORIES:
+        {categories_str}
 
         OUTPUT FORMAT (valid JSON array only, no markdown):
         [
           {{
             "tool_name": "...",
-            "category": "...",
-            "mentions": <int>,
+            "category": "<one of the categories above>",
+            "mentions": <int — MUST equal positive_mentions_across_sources>,
             "description": "1 sentence.",
-            "source_link": "https://..."
+            "source_link": "https://tool-website.com"
           }}
         ]
 
         RULES:
-        - "mentions" = count of positive mentions across all sources.
-        - "source_link" = the tool's own website, not the newsletter.
-        - "description" = 1 sentence max.
+        - Return the top 25 tools (or fewer if fewer exist).
+        - "mentions" MUST exactly match the "positive_mentions_across_sources"
+          value from the input. Do NOT re-count or estimate.
+        - Keep tools sorted by mentions descending.
+        - "source_link" = the tool's own website, NOT the newsletter URL.
 
-        MENTIONS DATA:
-        {mentions_text}
+        RANKED TOOLS DATA:
+        {json.dumps(ranked_summary, indent=2)}
     """)
 
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
@@ -485,13 +658,14 @@ def _llm_tools_log(mentions_text: str) -> list:
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
-def _llm_field_tools(mentions_text: str) -> list:
-    """Ask the LLM for the top 5 tools per category."""
+def _llm_field_tools_from_ranked(ranked_summary: list[dict]) -> list:
+    """Ask the LLM for the top 5 tools per category using ranked data."""
     categories_str = "\n".join(f"- {c}" for c in config.CATEGORIES)
 
     prompt = textwrap.dedent(f"""\
-        Below are AI tool mentions extracted from multiple newsletter sources.
-        For EACH of the 12 categories below, return the top 5 tools ranked 1-5.
+        Below are AI tools ranked by how many independent sources mentioned
+        them positively. Use this data to select the top 5 tools for each
+        of the 12 categories below.
 
         CATEGORIES:
         {categories_str}
@@ -503,18 +677,19 @@ def _llm_field_tools(mentions_text: str) -> list:
             "rank": <1-5>,
             "tool_name": "...",
             "why_recommended": "1 sentence.",
-            "url": "https://..."
+            "url": "https://tool-website.com"
           }}
         ]
 
         RULES:
-        - rank 1 = best in category.
+        - rank 1 = best in category (most positively mentioned + most relevant).
         - If fewer than 5 tools exist for a category, include as many as possible.
         - "url" = the tool's own website.
         - "why_recommended" = 1 sentence max.
+        - Prefer tools with higher positive_mentions_across_sources counts.
 
-        MENTIONS DATA:
-        {mentions_text}
+        RANKED TOOLS DATA:
+        {json.dumps(ranked_summary, indent=2)}
     """)
 
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
@@ -531,19 +706,8 @@ def _llm_field_tools(mentions_text: str) -> list:
     return json.loads(response.text)
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
-def _llm_rank_and_categorise(mentions_text: str) -> dict:
-    """Run two separate LLM calls for tools_log and field_tools."""
-    log.info("LLM tools_log pass …")
-    tools_log = _llm_tools_log(mentions_text)
-    time.sleep(15)
-    log.info("LLM field_tools pass …")
-    field_tools = _llm_field_tools(mentions_text)
-    return {"tools_log": tools_log, "field_tools": field_tools}
-
-
 # ===================================================================
-# 5. Google Sheets Output
+# 7. Google Sheets Output
 # ===================================================================
 def write_to_sheets(creds: Credentials, data: dict) -> None:
     """Write the analysed tool data to the two Google Sheets tabs."""
@@ -608,23 +772,6 @@ def _ensure_tab_exists(service, spreadsheet_id: str, tab_name: str) -> None:
         log.info("Created new sheet tab: '%s'", tab_name)
 
 
-def _ensure_headers(service, spreadsheet_id: str, tab_name: str, headers: list[str]) -> None:
-    """Write header row if the tab is empty."""
-    result = (
-        service.spreadsheets()
-        .values()
-        .get(spreadsheetId=spreadsheet_id, range=f"'{tab_name}'!A1:Z1")
-        .execute()
-    )
-    if not result.get("values"):
-        service.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"'{tab_name}'!A1",
-            valueInputOption="RAW",
-            body={"values": [headers]},
-        ).execute()
-
-
 def _overwrite_rows(service, spreadsheet_id: str, tab_name: str, headers: list[str], rows: list[list]) -> None:
     """Clear the tab and write headers + rows from scratch."""
     service.spreadsheets().values().clear(
@@ -640,7 +787,7 @@ def _overwrite_rows(service, spreadsheet_id: str, tab_name: str, headers: list[s
 
 
 # ===================================================================
-# 6. Main Orchestrator
+# 8. Main Orchestrator
 # ===================================================================
 def main() -> None:
     """Run the full extraction → analysis → output pipeline."""
@@ -662,11 +809,11 @@ def main() -> None:
         return
 
     log.info(
-        "Collected %d articles and %d emails. Sending to LLM for analysis …",
+        "Collected %d articles and %d emails. Starting per-source analysis …",
         len(articles), len(emails),
     )
 
-    # Step 3: LLM analysis
+    # Step 3: Per-source LLM extraction + deterministic ranking + LLM categorisation
     data = analyze_content(articles, emails)
 
     # Step 4: Write results to Google Sheets
