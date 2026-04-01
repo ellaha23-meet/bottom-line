@@ -419,6 +419,29 @@ def _chunk_text(text: str, max_chars: int) -> list[str]:
     return chunks
 
 
+def _clean_json_response(text: str) -> str:
+    """Strip markdown fences and other wrapping from an LLM JSON response."""
+    cleaned = text.strip()
+    # Remove markdown code fences (```json ... ``` or ``` ... ```)
+    cleaned = re.sub(r"^```(?:json)?\s*\n?", "", cleaned)
+    cleaned = re.sub(r"\n?```\s*$", "", cleaned)
+    cleaned = cleaned.strip()
+    # If the response doesn't start with [ or {, try to extract the JSON part
+    if cleaned and cleaned[0] not in ("[", "{"):
+        # Find the first [ or { and last ] or }
+        start = min(
+            (cleaned.find(c) for c in ("[", "{") if cleaned.find(c) != -1),
+            default=-1,
+        )
+        if start != -1:
+            open_char = cleaned[start]
+            close_char = "]" if open_char == "[" else "}"
+            end = cleaned.rfind(close_char)
+            if end > start:
+                cleaned = cleaned[start : end + 1]
+    return cleaned
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
 def _llm_extract_tools(text_chunk: str) -> str:
     """Ask the LLM to list AI tools mentioned in a text chunk."""
@@ -437,10 +460,27 @@ def _llm_extract_tools(text_chunk: str) -> str:
         generation_config=genai.GenerationConfig(
             max_output_tokens=config.LLM_MAX_TOKENS,
             temperature=0.2,
+            response_mime_type="application/json",
         ),
     )
     response = model.generate_content(text_chunk)
-    return response.text
+    raw = response.text
+    # Validate that the response is parseable JSON
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            log.info("-> extracted %d tool mentions from chunk", len(parsed))
+        return raw
+    except json.JSONDecodeError:
+        cleaned = _clean_json_response(raw)
+        try:
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, list):
+                log.info("-> extracted %d tool mentions from chunk (after cleanup)", len(parsed))
+            return cleaned
+        except json.JSONDecodeError:
+            log.warning("Could not parse LLM JSON output (%d chars). Returning empty list.", len(raw))
+            return "[]"
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
@@ -481,7 +521,12 @@ def _llm_tools_log(mentions_text: str) -> list:
         ),
     )
     response = model.generate_content(prompt)
-    return json.loads(response.text)
+    raw = response.text
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        cleaned = _clean_json_response(raw)
+        return json.loads(cleaned)
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
@@ -528,7 +573,12 @@ def _llm_field_tools(mentions_text: str) -> list:
         ),
     )
     response = model.generate_content(prompt)
-    return json.loads(response.text)
+    raw = response.text
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        cleaned = _clean_json_response(raw)
+        return json.loads(cleaned)
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
