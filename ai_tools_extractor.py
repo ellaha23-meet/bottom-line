@@ -677,6 +677,20 @@ def _llm_analyze_ranked(ranked_tools: list[dict], mention_details: list[dict]) -
     tools_log = _llm_tools_log_from_ranked(ranked_summary)
     time.sleep(RATE_LIMIT_SLEEP)
 
+    # Build a tool_name → URL lookup from the tools_log results so the
+    # field_tools call has real URLs (no extra API call needed)
+    tool_url_map = {}
+    for t in tools_log:
+        name = t.get("tool_name", "")
+        url = t.get("source_link", "")
+        if name and url:
+            tool_url_map[name.lower().strip()] = url
+
+    # Inject known URLs into the ranked summary for the field_tools call
+    for entry in ranked_summary:
+        key = entry["tool_name"].lower().strip()
+        entry["tool_website_url"] = tool_url_map.get(key, "")
+
     # --- Call 2: Field Tools ---
     log.info("LLM field_tools categorisation pass …")
     field_tools = _llm_field_tools_from_ranked(ranked_summary)
@@ -760,6 +774,10 @@ def _llm_field_tools_from_ranked(ranked_summary: list[dict]) -> list:
         "use_cases_from_sources" — these are the actual descriptions and
         use-cases extracted from the newsletter content.
 
+        Each tool also includes a "tool_website_url" field — this is the
+        tool's actual website URL. You MUST copy it exactly into the "url"
+        field of your output. Do NOT invent or guess URLs.
+
         Your job: for EACH of the 12 categories below, select the top 5 tools
         whose EXTRACTED use-cases and descriptions best fit that category.
 
@@ -778,7 +796,7 @@ def _llm_field_tools_from_ranked(ranked_summary: list[dict]) -> list:
             "rank": <1-5>,
             "tool_name": "...",
             "why_recommended": "1 sentence based on extracted use-cases.",
-            "url": "https://tool-website.com"
+            "url": "<copy from tool_website_url field>"
           }}
         ]
 
@@ -787,7 +805,8 @@ def _llm_field_tools_from_ranked(ranked_summary: list[dict]) -> list:
           highest positive_mentions_across_sources count).
         - If fewer than 5 tools fit a category based on extracted content,
           include only those that actually fit.
-        - "url" = the tool's own website.
+        - "url" MUST be copied exactly from the "tool_website_url" field in
+          the input data. If "tool_website_url" is empty, use "N/A".
         - "why_recommended" = 1 sentence summarising the extracted use-case,
           NOT your own knowledge.
         - Prefer tools with higher positive_mentions_across_sources counts
