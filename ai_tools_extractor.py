@@ -419,6 +419,34 @@ def _chunk_text(text: str, max_chars: int) -> list[str]:
     return chunks
 
 
+def _parse_llm_json(text: str) -> list:
+    """Extract and parse a JSON array from LLM output, stripping markdown fences if present."""
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Strip markdown code fences (```json ... ``` or ``` ... ```)
+    stripped = re.sub(r"^```(?:json)?\s*\n?", "", text.strip(), count=1)
+    stripped = re.sub(r"\n?```\s*$", "", stripped.strip(), count=1)
+    try:
+        return json.loads(stripped)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Try to find a JSON array anywhere in the text
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    log.warning("Could not parse LLM JSON output (%d chars). Returning empty list.", len(text))
+    return []
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
 def _llm_extract_tools(text_chunk: str) -> str:
     """Ask the LLM to list AI tools mentioned in a text chunk."""
@@ -437,6 +465,7 @@ def _llm_extract_tools(text_chunk: str) -> str:
         generation_config=genai.GenerationConfig(
             max_output_tokens=config.LLM_MAX_TOKENS,
             temperature=0.2,
+            response_mime_type="application/json",
         ),
     )
     response = model.generate_content(text_chunk)
@@ -481,7 +510,7 @@ def _llm_tools_log(mentions_text: str) -> list:
         ),
     )
     response = model.generate_content(prompt)
-    return json.loads(response.text)
+    return _parse_llm_json(response.text)
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
@@ -528,7 +557,7 @@ def _llm_field_tools(mentions_text: str) -> list:
         ),
     )
     response = model.generate_content(prompt)
-    return json.loads(response.text)
+    return _parse_llm_json(response.text)
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
