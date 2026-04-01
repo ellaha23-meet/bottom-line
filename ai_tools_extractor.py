@@ -366,25 +366,36 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
 
     Returns a dict with keys ``"tools_log"`` and ``"field_tools"``.
     """
-    # Build a combined text digest for the LLM
-    digest_parts: list[str] = []
+    # Build per-source entries with unique IDs so we can count distinct sources
+    sources: list[dict] = []
+    for i, art in enumerate(articles):
+        sources.append({
+            "source_id": f"art_{i}",
+            "label": art["source"],
+            "text": (
+                f"Title: {art['title']}\nDate: {art['date']}\n"
+                f"URL: {art['url']}\nContent:\n{art['content']}"
+            ),
+        })
 
-    for art in articles:
-        digest_parts.append(
-            f"[Source: {art['source']}]\nTitle: {art['title']}\n"
-            f"Date: {art['date']}\nURL: {art['url']}\n"
-            f"Content:\n{art['content']}\n{'---'}\n"
-        )
+    for i, email in enumerate(emails):
+        sources.append({
+            "source_id": f"email_{i}",
+            "label": f"Gmail / {config.GMAIL_LABEL}",
+            "text": (
+                f"Subject: {email['subject']}\nDate: {email['date']}\n"
+                f"Content:\n{email['body']}"
+            ),
+        })
 
-    for email in emails:
-        digest_parts.append(
-            f"[Source: Gmail / {config.GMAIL_LABEL}]\n"
-            f"Subject: {email['subject']}\nDate: {email['date']}\n"
-            f"Content:\n{email['body'][:6000]}\n{'---'}\n"
-        )
+    log.info("Total sources to analyse: %d articles + %d emails = %d",
+             len(articles), len(emails), len(sources))
 
-    # Split into chunks for the LLM (≈800 000 chars ≈ 200k tokens, fits in 1-2 chunks)
-    chunks = _chunk_text("\n".join(digest_parts), max_chars=800_000)
+    # Build chunks of sources that fit within the LLM context window.
+    # Each source is clearly delimited with its source_id so the LLM can tag
+    # extracted tools back to the source they came from.
+    chunks = _build_source_chunks(sources, max_chars=800_000)
+    log.info("Split into %d chunk(s) for Phase 1.", len(chunks))
 
     # Phase 1: extract raw tool mentions from each chunk
     raw_mentions: list[str] = []
@@ -395,55 +406,77 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
             time.sleep(15)  # 5 RPM limit: wait 15s between chunks
 
     # Phase 1.5: deterministic local counting & ranking
-    log.info("Counting positive mentions locally …")
+    log.info("Counting mentions per tool across sources locally …")
     pre_ranked = _parse_and_count_mentions(raw_mentions)
     log.info(
-        "Local counting complete: %d tools with positive mentions (top: %s)",
+        "Local counting complete: %d tools found (top: %s with %d source mentions)",
         len(pre_ranked),
         pre_ranked[0]["tool_name"] if pre_ranked else "N/A",
+        pre_ranked[0]["positive_mentions"] if pre_ranked else 0,
     )
 
     # Phase 2: LLM enrichment (description/category only) + field_tools
-    combined_mentions = "\n\n".join(raw_mentions)
     log.info("LLM enrichment & categorisation pass …")
     time.sleep(15)  # wait before ranking call to respect rate limit
-    final_json = _llm_rank_and_categorise(pre_ranked, combined_mentions)
+    final_json = _llm_rank_and_categorise(pre_ranked)
 
     return final_json
 
 
-def _chunk_text(text: str, max_chars: int) -> list[str]:
-    """Split text into chunks of approximately max_chars."""
-    if len(text) <= max_chars:
-        return [text]
-    chunks, start = [], 0
-    while start < len(text):
-        end = start + max_chars
-        # Try to split at a paragraph boundary
-        boundary = text.rfind("\n---\n", start, end)
-        if boundary > start:
-            end = boundary + 5
-        chunks.append(text[start:end])
-        start = end
+def _build_source_chunks(sources: list[dict], max_chars: int) -> list[str]:
+    """Pack sources into chunks ≤ max_chars, each source clearly delimited."""
+    chunks: list[str] = []
+    current_parts: list[str] = []
+    current_len = 0
+
+    for src in sources:
+        entry = (
+            f"=== SOURCE_ID: {src['source_id']} | {src['label']} ===\n"
+            f"{src['text']}\n"
+            f"=== END SOURCE_ID: {src['source_id']} ===\n"
+        )
+        if current_len + len(entry) > max_chars and current_parts:
+            chunks.append("\n".join(current_parts))
+            current_parts = []
+            current_len = 0
+        current_parts.append(entry)
+        current_len += len(entry)
+
+    if current_parts:
+        chunks.append("\n".join(current_parts))
+
     return chunks
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
 def _llm_extract_tools(text_chunk: str) -> str:
-    """Ask the LLM to list AI tools mentioned in a text chunk."""
+    """Ask the LLM to list AI tools mentioned in a text chunk.
+
+    The chunk contains multiple sources delimited by SOURCE_ID markers.
+    The LLM must tag each extracted tool with the source_id it came from.
+    """
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
     model = genai.GenerativeModel(
         model_name=config.LLM_MODEL,
         system_instruction=textwrap.dedent("""\
-            You are an AI-tools analyst. Given newsletter content, extract
-            every AI tool mentioned. For each tool output:
-            - tool_name (string)
-            - sentiment ("positive", "neutral", or "negative")
-            - description (1 sentence)
-            - source_url (if mentioned, else "N/A")
-            Return the results as a JSON array of objects.
-            Each mention of a tool should be a separate entry — do NOT
-            deduplicate or aggregate; list every individual occurrence.
+            You are an AI-tools analyst. The input contains newsletter
+            content from MULTIPLE sources, each delimited by
+            === SOURCE_ID: <id> === ... === END SOURCE_ID: <id> ===
+
+            For EVERY source, extract EVERY AI tool or product mentioned.
+            Output one JSON object per tool-source pair:
+            - "source_id": the SOURCE_ID the tool was found in (copy exactly)
+            - "tool_name": the tool/product name (use official casing)
+            - "sentiment": "positive", "neutral", or "negative"
+            - "description": 1 sentence about the tool
+            - "source_url": the tool's URL if mentioned, else "N/A"
+
+            CRITICAL RULES:
+            - If the SAME tool appears in MULTIPLE sources, output a
+              SEPARATE entry for each source — one row per source.
+            - Do NOT skip sources. Process every single source in the input.
+            - Do NOT deduplicate across sources.
+            - Return a JSON array of objects.
         """),
         generation_config=genai.GenerationConfig(
             max_output_tokens=config.LLM_MAX_TOKENS,
@@ -471,60 +504,51 @@ def _llm_extract_tools(text_chunk: str) -> str:
 
 
 def _parse_and_count_mentions(raw_mentions: list[str]) -> list[dict]:
-    """Parse Phase 1 JSON outputs and deterministically count positive mentions.
+    """Parse Phase 1 JSON outputs and deterministically count source mentions.
 
-    Returns a list of dicts sorted by positive mention count (descending):
+    "mentions" = number of distinct sources (articles / emails) in which
+    a tool was mentioned with positive sentiment.  This is a real count
+    that cannot be hallucinated.
+
+    Returns a list of dicts sorted by mention count (descending):
         [{"tool_name": str, "positive_mentions": int,
+          "total_mentions": int,
           "descriptions": list[str], "source_urls": list[str]}, ...]
     """
-    from collections import Counter
+    # tool_key -> set of source_ids where it appeared positively
+    tool_positive_sources: dict[str, set[str]] = {}
+    # tool_key -> set of ALL source_ids where it appeared
+    tool_all_sources: dict[str, set[str]] = {}
+    # tool_key -> metadata
+    tool_meta: dict[str, dict] = {}
 
-    tool_positive_counts: Counter = Counter()
-    tool_descriptions: dict[str, list[str]] = {}
-    tool_urls: dict[str, list[str]] = {}
+    total_entries = 0
 
     for raw in raw_mentions:
-        # Strip markdown fences if the LLM wrapped the JSON
-        text = raw.strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
-
-        try:
-            entries = json.loads(text)
-        except json.JSONDecodeError:
-            # Try to find a JSON array in the text
-            match = re.search(r"\[.*\]", text, re.DOTALL)
-            if match:
-                try:
-                    entries = json.loads(match.group())
-                except json.JSONDecodeError:
-                    log.warning("Could not parse Phase 1 chunk as JSON, skipping")
-                    continue
-            else:
-                log.warning("No JSON array found in Phase 1 chunk, skipping")
-                continue
-
-        if not isinstance(entries, list):
+        entries = _safe_parse_json_array(raw)
+        if entries is None:
             continue
 
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
-            # Normalise tool name: strip whitespace, title-case for grouping
-            name = entry.get("tool_name") or entry.get("Tool Name") or ""
-            name = name.strip()
+            total_entries += 1
+
+            name = (entry.get("tool_name") or entry.get("Tool Name") or "").strip()
             if not name:
                 continue
-            # Canonical key: lowercased for dedup
             key = name.lower()
+
+            source_id = (entry.get("source_id") or "unknown").strip()
 
             sentiment = str(
                 entry.get("sentiment") or entry.get("Sentiment") or ""
             ).strip().lower()
 
+            # Track unique sources
+            tool_all_sources.setdefault(key, set()).add(source_id)
             if sentiment == "positive":
-                tool_positive_counts[key] += 1
+                tool_positive_sources.setdefault(key, set()).add(source_id)
 
             desc = (
                 entry.get("description")
@@ -539,25 +563,60 @@ def _parse_and_count_mentions(raw_mentions: list[str]) -> list[dict]:
                 or "N/A"
             )
 
-            # Keep the best-cased version of the name
-            tool_descriptions.setdefault(key, {"display_name": name, "descs": [], "urls": []})
+            if key not in tool_meta:
+                tool_meta[key] = {"display_name": name, "descs": [], "urls": []}
             if desc:
-                tool_descriptions[key]["descs"].append(desc.strip())
+                tool_meta[key]["descs"].append(desc.strip())
             if url and url != "N/A":
-                tool_descriptions[key]["urls"].append(url.strip())
+                tool_meta[key]["urls"].append(url.strip())
 
-    # Build ranked list (only tools with at least 1 positive mention)
+    log.info("Phase 1 produced %d total extraction entries.", total_entries)
+
+    # Build ranked list — sort by positive source count, then total source count
     ranked = []
-    for key, count in tool_positive_counts.most_common():
-        info = tool_descriptions.get(key, {})
+    for key in tool_all_sources:
+        pos_count = len(tool_positive_sources.get(key, set()))
+        total_count = len(tool_all_sources[key])
+        info = tool_meta.get(key, {})
         ranked.append({
             "tool_name": info.get("display_name", key),
-            "positive_mentions": count,
-            "descriptions": info.get("descs", [])[:3],  # keep up to 3 for LLM context
-            "source_urls": [u for u in dict.fromkeys(info.get("urls", []))],  # deduplicated
+            "positive_mentions": pos_count,
+            "total_mentions": total_count,
+            "descriptions": list(dict.fromkeys(info.get("descs", [])))[:3],
+            "source_urls": list(dict.fromkeys(info.get("urls", []))),
         })
 
-    return ranked[:25]
+    ranked.sort(key=lambda x: (x["positive_mentions"], x["total_mentions"]), reverse=True)
+    return ranked
+
+
+def _safe_parse_json_array(raw: str) -> list | None:
+    """Best-effort parse of an LLM JSON array response."""
+    text = raw.strip()
+    # Strip markdown fences
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+    try:
+        result = json.loads(text)
+        if isinstance(result, list):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # Try to find a JSON array in the text
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if match:
+        try:
+            result = json.loads(match.group())
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+    log.warning("Could not parse Phase 1 chunk as JSON array, skipping")
+    return None
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
@@ -573,6 +632,7 @@ def _llm_tools_log(pre_ranked: list[dict]) -> list:
             {
                 "tool_name": t["tool_name"],
                 "positive_mentions": t["positive_mentions"],
+                "total_mentions": t["total_mentions"],
                 "sample_descriptions": t["descriptions"],
                 "source_urls": t["source_urls"],
             }
@@ -635,16 +695,39 @@ def _llm_tools_log(pre_ranked: list[dict]) -> list:
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
-def _llm_field_tools(mentions_text: str) -> list:
-    """Ask the LLM for the top 5 tools per category."""
+def _llm_field_tools(pre_ranked: list[dict]) -> list:
+    """Ask the LLM for the top 5 tools per category.
+
+    Uses the pre-ranked tool list so the LLM can only pick from tools
+    that were actually found in the sources.
+    """
     categories_str = "\n".join(f"- {c}" for c in config.CATEGORIES)
 
+    tools_summary = json.dumps(
+        [
+            {
+                "tool_name": t["tool_name"],
+                "positive_mentions": t["positive_mentions"],
+                "total_mentions": t["total_mentions"],
+                "sample_descriptions": t["descriptions"],
+                "source_urls": t["source_urls"],
+            }
+            for t in pre_ranked
+        ],
+        indent=2,
+    )
+
     prompt = textwrap.dedent(f"""\
-        Below are AI tool mentions extracted from multiple newsletter sources.
-        For EACH of the 12 categories below, return the top 5 tools ranked 1-5.
+        Below is a verified list of AI tools extracted from newsletter sources,
+        ranked by number of source mentions.
+        For EACH of the categories below, pick the top 5 tools from this list
+        that best fit the category and rank them 1-5.
 
         CATEGORIES:
         {categories_str}
+
+        VERIFIED TOOLS (only pick from these):
+        {tools_summary}
 
         OUTPUT FORMAT (valid JSON array only, no markdown):
         [
@@ -659,12 +742,10 @@ def _llm_field_tools(mentions_text: str) -> list:
 
         RULES:
         - rank 1 = best in category.
+        - ONLY use tools from the VERIFIED TOOLS list above — do NOT invent tools.
         - If fewer than 5 tools exist for a category, include as many as possible.
         - "url" = the tool's own website.
         - "why_recommended" = 1 sentence max.
-
-        MENTIONS DATA:
-        {mentions_text}
     """)
 
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
@@ -682,13 +763,13 @@ def _llm_field_tools(mentions_text: str) -> list:
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
-def _llm_rank_and_categorise(pre_ranked: list[dict], mentions_text: str) -> dict:
+def _llm_rank_and_categorise(pre_ranked: list[dict]) -> dict:
     """Run two separate LLM calls for tools_log and field_tools."""
-    log.info("LLM tools_log pass …")
-    tools_log = _llm_tools_log(pre_ranked)
+    log.info("LLM tools_log pass (top 25) …")
+    tools_log = _llm_tools_log(pre_ranked[:25])
     time.sleep(15)
-    log.info("LLM field_tools pass …")
-    field_tools = _llm_field_tools(mentions_text)
+    log.info("LLM field_tools pass (all %d tools) …", len(pre_ranked))
+    field_tools = _llm_field_tools(pre_ranked)
     return {"tools_log": tools_log, "field_tools": field_tools}
 
 
