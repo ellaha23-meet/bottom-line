@@ -452,7 +452,22 @@ def _llm_extract_tools(text_chunk: str) -> str:
         ),
     )
     response = model.generate_content(text_chunk)
-    return response.text
+    text = response.text
+
+    # Detect truncated JSON (hit max_output_tokens before closing the array)
+    stripped = text.rstrip()
+    if stripped and not stripped.endswith("]"):
+        log.warning(
+            "Phase 1 output appears truncated (last char: %r). "
+            "Consider reducing chunk size or increasing LLM_MAX_TOKENS.",
+            stripped[-1] if stripped else "",
+        )
+        # Try to salvage: close the last complete object and the array
+        last_brace = stripped.rfind("}")
+        if last_brace > 0:
+            text = stripped[: last_brace + 1] + "]"
+
+    return text
 
 
 def _parse_and_count_mentions(raw_mentions: list[str]) -> list[dict]:
