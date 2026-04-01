@@ -374,19 +374,22 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
       3. The deterministic ranked list is sent to the LLM for
          categorisation and description enrichment (Phase 2).
     """
-    # Build a combined text digest for the LLM
+    # Build a combined text digest for the LLM, assigning a unique
+    # source_id to each article/email so extraction can reference it.
     digest_parts: list[str] = []
 
-    for art in articles:
+    for idx, art in enumerate(articles, start=1):
+        sid = f"art_{idx}"
         digest_parts.append(
-            f"[Source: {art['source']}]\nTitle: {art['title']}\n"
-            f"Date: {art['date']}\nURL: {art['url']}\n"
+            f"[source_id: {sid}]\n[Source: {art['source']}]\n"
+            f"Title: {art['title']}\nDate: {art['date']}\nURL: {art['url']}\n"
             f"Content:\n{art['content']}\n{'---'}\n"
         )
 
-    for email in emails:
+    for idx, email in enumerate(emails, start=1):
+        sid = f"email_{idx}"
         digest_parts.append(
-            f"[Source: Gmail / {config.GMAIL_LABEL}]\n"
+            f"[source_id: {sid}]\n[Source: Gmail / {config.GMAIL_LABEL}]\n"
             f"Subject: {email['subject']}\nDate: {email['date']}\n"
             f"Content:\n{email['body'][:6000]}\n{'---'}\n"
         )
@@ -444,7 +447,8 @@ def _llm_extract_tools(text_chunk: str) -> str:
     """Ask the LLM to list AI tools mentioned in a text chunk.
 
     Returns raw JSON text (a JSON array of tool mention objects).
-    Each mention is one occurrence of a tool in one source article/email.
+    Each mention is one occurrence of a tool in one source article/email,
+    including a ``use_case`` that captures how the source recommends the tool.
     """
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
     model = genai.GenerativeModel(
@@ -456,12 +460,15 @@ def _llm_extract_tools(text_chunk: str) -> str:
             (one entry per source article/email).
 
             For each mention output:
+            - source_id: the [source_id: ...] tag from the article header
             - tool_name: the canonical name of the tool
             - sentiment: positive / neutral / negative
             - description: 1 sentence about what the tool does
+            - use_case: 1 sentence describing how THIS specific article/email
+              recommends or discusses using the tool (e.g. "Article recommends
+              it for automating multi-step refactoring across large codebases").
+              Be specific to what the source says, not generic.
             - source_url: the tool's own website URL (if known, else "N/A")
-            - source_article: the title or source of the article/email where
-              this mention was found
 
             Return the results as a JSON array of objects. Do NOT deduplicate
             — output one entry per mention per source.
@@ -502,9 +509,8 @@ def _deterministic_count_and_rank(all_mentions: list[dict]) -> list[dict]:
     """Deterministically count and rank tools by total mentions.
 
     Each entry in *all_mentions* represents one individual mention of a tool
-    from one source.  We normalise names, count occurrences, pick the best
-    metadata (description, source_url) from the most common variant, and
-    return a list sorted by mention count descending.
+    from one source.  We normalise names, count occurrences, collect all
+    use_cases, and return a list sorted by mention count descending.
     """
     # Count mentions per normalised tool name
     counts: dict[str, int] = collections.Counter()
@@ -539,11 +545,18 @@ def _deterministic_count_and_rank(all_mentions: list[dict]) -> list[dict]:
             key=len,
             default="",
         )
+        # Collect all unique use_cases from the sources
+        use_cases = list(dict.fromkeys(
+            e.get("use_case", "").strip()
+            for e in entries
+            if e.get("use_case", "").strip()
+        ))
         ranked.append({
             "tool_name": best_name,
             "mentions": count,
             "description": best_desc,
             "source_url": source_url,
+            "use_cases": use_cases,
         })
 
     return ranked
@@ -564,14 +577,19 @@ def _llm_tools_log(ranked_tools: list[dict]) -> list:
         exact mention counts across newsletter sources. The ranking and
         counts are FINAL — do NOT change them.
 
+        Each tool includes a "use_cases" array — these are real quotes from
+        newsletter articles describing how the tool is recommended. Use
+        these use_cases to determine the best "category" for each tool.
+
         Your job is to ENRICH each tool entry by:
-        1. Adding a "category" field (one of the categories below, or a
-           short custom label if none fit).
+        1. Adding a "category" field based on the use_cases extracted from
+           the articles (pick the category that best matches how the
+           articles actually recommend using the tool, NOT generic knowledge).
         2. Polishing the "description" to exactly 1 clear sentence.
         3. Setting "source_link" to the tool's own website URL (not the
            newsletter). If you don't know it, use the source_url provided.
 
-        CATEGORIES (pick the best fit):
+        CATEGORIES (pick the best fit based on the use_cases):
         {chr(10).join("- " + c for c in config.CATEGORIES)}
 
         INPUT (ranked tools with deterministic counts):
@@ -632,9 +650,14 @@ def _llm_field_tools(ranked_tools: list[dict]) -> list:
         ranked by mention count. You MUST ONLY recommend tools from this
         list — do NOT add any tool that is not in this list.
 
+        Each tool includes a "use_cases" array — these are real quotes from
+        newsletter articles describing how the tool is recommended. Use
+        these use_cases to decide which category each tool fits best, and
+        to write the "why_recommended" sentence.
+
         For EACH of the 12 categories below, pick the top 5 tools (ranked
-        1-5) that best fit that category. Use the tool_name EXACTLY as it
-        appears in the list.
+        1-5) that best fit that category based on their use_cases. Use the
+        tool_name EXACTLY as it appears in the list.
 
         CATEGORIES:
         {categories_str}
