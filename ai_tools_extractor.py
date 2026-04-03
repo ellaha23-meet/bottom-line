@@ -446,15 +446,20 @@ def _llm_extract_tools(text_chunk: str) -> str:
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
 def _llm_tools_log(mentions_text: str) -> list:
     """Ask the LLM for the top 25 tools ranked by mentions."""
+    categories_str = "\n".join(f"- {c}" for c in config.CATEGORIES)
+
     prompt = textwrap.dedent(f"""\
         Below are AI tool mentions extracted from multiple newsletter sources.
         Return a JSON array of the top 25 tools sorted by positive mentions (descending).
+
+        CATEGORIES (assign every category that applies):
+        {categories_str}
 
         OUTPUT FORMAT (valid JSON array only, no markdown):
         [
           {{
             "tool_name": "...",
-            "category": "...",
+            "categories": ["<category 1>", "<category 2>"],
             "mentions": <int>,
             "description": "1 sentence.",
             "source_link": "https://..."
@@ -462,6 +467,9 @@ def _llm_tools_log(mentions_text: str) -> list:
         ]
 
         RULES:
+        - "categories" = list of ALL matching categories from the list above.
+          A tool may belong to multiple categories. Include every category the
+          sources recommend it for. Use the exact category names above.
         - "mentions" = count of positive mentions across all sources.
         - "source_link" = the tool's own website, not the newsletter.
         - "description" = 1 sentence max.
@@ -509,6 +517,7 @@ def _llm_field_tools(mentions_text: str) -> list:
 
         RULES:
         - rank 1 = best in category.
+        - The same tool MAY appear in multiple categories if it genuinely fits.
         - If fewer than 5 tools exist for a category, include as many as possible.
         - "url" = the tool's own website.
         - "why_recommended" = 1 sentence max.
@@ -561,10 +570,13 @@ def write_to_sheets(creds: Credentials, data: dict) -> None:
 
     rows_log = []
     for tool in data.get("tools_log", []):
+        categories = tool.get("categories") or tool.get("category", "")
+        if isinstance(categories, list):
+            categories = ", ".join(categories)
         rows_log.append([
             today,
             tool.get("tool_name", ""),
-            tool.get("category", ""),
+            categories,
             tool.get("mentions", 0),
             tool.get("description", ""),
             tool.get("source_link", ""),
