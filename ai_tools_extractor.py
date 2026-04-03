@@ -516,7 +516,8 @@ def _llm_field_tools(mentions_text: str) -> list:
         ]
 
         RULES:
-        - rank 1 = best in category.
+        - Rank tools by the number of DISTINCT sources that mention them
+          positively for that category. rank 1 = most positive source mentions.
         - The same tool MAY appear in multiple categories if it genuinely fits.
         - If fewer than 5 tools exist for a category, include as many as possible.
         - "url" = the tool's own website.
