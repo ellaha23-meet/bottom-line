@@ -470,7 +470,7 @@ def _llm_tools_log(mentions_text: str) -> list:
         - "categories" = list of ALL matching categories from the list above.
           A tool may belong to multiple categories. Include every category the
           sources recommend it for. Use the exact category names above.
-        - "mentions" = count of positive mentions across all sources.
+        - "mentions" = number of DISTINCT sources that mention the tool positively.
         - "source_link" = the tool's own website, not the newsletter.
         - "description" = 1 sentence max.
 
