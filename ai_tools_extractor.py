@@ -383,8 +383,10 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
             f"Content:\n{email['body']}\n{'---'}\n"
         )
 
-    # Split into chunks for the LLM (≈800 000 chars ≈ 200k tokens)
-    chunks = _chunk_text("\n".join(digest_parts), max_chars=800_000)
+    # Split into chunks for the LLM.
+    # 400k chars ≈ 100k tokens input + 32k output ≈ 132k tokens per request,
+    # well within the 250k TPM limit and leaves headroom for retries.
+    chunks = _chunk_text("\n".join(digest_parts), max_chars=400_000)
 
     # Phase 1: LLM extracts structured tool mentions from each chunk
     all_mentions: list[dict] = []
@@ -395,7 +397,7 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
         log.info("  -> extracted %d tool mentions", len(parsed))
         all_mentions.extend(parsed)
         if i < len(chunks) - 1:
-            time.sleep(15)  # respect rate limit
+            time.sleep(60)  # wait 60s to stay within 250k TPM limit
 
     # Phase 2: deterministic aggregation and ranking (in Python, not LLM)
     log.info("Aggregating and ranking %d total tool mentions …", len(all_mentions))
@@ -424,7 +426,7 @@ def _chunk_text(text: str, max_chars: int) -> list[str]:
 # ---------------------------------------------------------------------------
 # Phase 1 helpers: LLM extraction
 # ---------------------------------------------------------------------------
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=30))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=60, max=120))
 def _llm_extract_tools(text_chunk: str) -> str:
     """Ask the LLM to list AI tools mentioned in a text chunk.
 
