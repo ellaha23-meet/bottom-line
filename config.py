@@ -3,7 +3,7 @@ Configuration constants for the AI Tools Extraction pipeline.
 """
 
 # ---------------------------------------------------------------------------
-# Archive URLs to scrape (last 14 days of content)
+# Archive URLs to scrape (last LOOKBACK_DAYS days of content)
 # ---------------------------------------------------------------------------
 ARCHIVE_URLS = [
     "https://www.superhuman.ai/archive",
