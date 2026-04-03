@@ -442,8 +442,9 @@ def _llm_extract_tools(text_chunk: str) -> str:
             CRITICAL RULES:
             - Base your answers ONLY on the newsletter content provided below.
             - Do NOT use prior knowledge about these tools.
-            - If a piece of information (e.g. a URL) is not explicitly stated
-              in the provided text, write "N/A".
+            - For descriptions and sentiment, use ONLY the provided text.
+            - For tool_url, prefer URLs from the text but fall back to your
+              knowledge of the tool's official website if not found.
             - Extract EVERY AI tool mentioned in the text.
 
             For each tool, return a JSON object with these exact keys:
@@ -452,8 +453,9 @@ def _llm_extract_tools(text_chunk: str) -> str:
               on how the source describes the tool
             - "description": one sentence describing the tool, using ONLY what
               the newsletter says about it
-            - "tool_url": the tool's website URL ONLY if explicitly mentioned
-              in the text, otherwise "N/A"
+            - "tool_url": the tool's website URL if mentioned in the text;
+              if not found in the text, use your knowledge to provide the
+              tool's official website URL
             - "source_name": the newsletter/source that mentioned this tool
               (copy from the [Source: ...] header above each article)
             - "category": the single best-fitting category from this list:
