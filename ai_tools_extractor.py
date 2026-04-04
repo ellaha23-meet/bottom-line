@@ -97,7 +97,7 @@ def get_google_credentials() -> Credentials:
 def fetch_emails(creds: Credentials) -> list[dict]:
     """Fetch emails from Gmail with the configured newsletter label.
 
-    Returns a list of dicts: {"subject": ..., "date": ..., "body": ...}.
+    Returns a list of dicts: {"subject": ..., "date": ..., "from": ..., "body": ...}.
     Only emails from the last config.LOOKBACK_DAYS days are returned.
     """
     service = build("gmail", "v1", credentials=creds)
@@ -148,6 +148,7 @@ def fetch_emails(creds: Credentials) -> list[dict]:
         results.append({
             "subject": headers.get("Subject", ""),
             "date": headers.get("Date", ""),
+            "from": headers.get("From", ""),
             "body": body_text,
         })
 
@@ -391,6 +392,31 @@ def _recover_partial_json_array(text: str) -> list:
     return []
 
 
+def _canonical_source(raw_identifier: str) -> str:
+    """Map a raw domain or email address to its canonical provider name.
+
+    Looks up config.SOURCE_MAPPING first.  Falls back to the raw identifier
+    so new / unknown providers still get tracked (just without dedup).
+    """
+    # Direct lookup (covers archive domains and known email addresses)
+    if raw_identifier in config.SOURCE_MAPPING:
+        return config.SOURCE_MAPPING[raw_identifier]
+    # Fallback: strip common prefixes like "www."
+    stripped = raw_identifier.removeprefix("www.").lower()
+    return config.SOURCE_MAPPING.get(stripped, raw_identifier)
+
+
+def _extract_sender_address(from_header: str) -> str:
+    """Extract the bare email address from a From header.
+
+    Handles formats like:
+      "The Rundown AI <news+canned.response@daily.therundown.ai>"
+      "news@alphasignal.ai"
+    """
+    match = re.search(r"<([^>]+)>", from_header)
+    return match.group(1).strip().lower() if match else from_header.strip().lower()
+
+
 def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
     """Send collected content to the LLM and return structured tool data.
 
@@ -403,10 +429,14 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
     """
     # Build one entry per article / email — each entry is a self-contained
     # unit with its [Source: ...] header so it is never split across chunks.
+    # The [Source: ...] tag uses the CANONICAL provider name so that the
+    # same newsletter scraped from the web and received via Gmail maps to
+    # one provider, not two.
     entries: list[str] = []
 
     for art in articles:
-        source_name = art["source"].split("/")[2]  # e.g. "www.superhuman.ai"
+        domain = art["source"].split("/")[2]  # e.g. "www.superhuman.ai"
+        source_name = _canonical_source(domain)
         entries.append(
             f"[Source: {source_name}]\nTitle: {art['title']}\n"
             f"Date: {art['date']}\nURL: {art['url']}\n"
@@ -414,9 +444,10 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
         )
 
     for email in emails:
-        email_source = f"Gmail - {email['subject']}"
+        sender_addr = _extract_sender_address(email.get("from", ""))
+        source_name = _canonical_source(sender_addr)
         entries.append(
-            f"[Source: {email_source}]\n"
+            f"[Source: {source_name}]\n"
             f"Subject: {email['subject']}\nDate: {email['date']}\n"
             f"Content:\n{email['body'][:50000]}\n---"
         )
