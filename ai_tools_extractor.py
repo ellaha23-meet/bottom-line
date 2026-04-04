@@ -369,6 +369,28 @@ def _parse_llm_json(text: str):
     return json.loads(cleaned.strip())
 
 
+def _recover_partial_json_array(text: str) -> list:
+    """Recover as many complete JSON objects as possible from a truncated array.
+
+    When the LLM output is cut off mid-string, we find the last complete
+    object (ending with '}') and close the array so we salvage valid data
+    rather than discarding the entire chunk.
+    """
+    start = text.find("[")
+    if start == -1:
+        return []
+    # Walk backward from the end to find the last complete object boundary
+    for end_marker in ("}\n]", "},\n", "}, \n", "},", "}"):
+        pos = text.rfind(end_marker, start)
+        if pos != -1:
+            candidate = text[start : pos + 1] + "]"
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+    return []
+
+
 def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
     """Send collected content to the LLM and return structured tool data.
 
@@ -399,9 +421,10 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
             f"Content:\n{email['body'][:15000]}\n---\n"
         )
 
-    # Split into chunks of ~300K chars (~75K tokens) to stay within 250K TPM
-    # With 30s waits between calls: ~2 calls/min * ~107K tokens/call = ~214K TPM
-    chunks = _chunk_text("\n".join(digest_parts), max_chars=300_000)
+    # Split into chunks of ~150K chars (~37K tokens input).
+    # With 65K max output tokens per call, total per call ≈ 100K tokens.
+    # 60s waits between calls keeps us well under 250K TPM.
+    chunks = _chunk_text("\n".join(digest_parts), max_chars=150_000)
 
     # Phase 1: extract structured tool mentions from each chunk
     all_mentions: list[dict] = []
@@ -499,7 +522,19 @@ def _llm_extract_tools(text_chunk: str) -> list[dict]:
         ),
     )
     response = model.generate_content(text_chunk)
-    return json.loads(response.text)
+    try:
+        return json.loads(response.text)
+    except json.JSONDecodeError:
+        log.warning(
+            "LLM response appears truncated (JSONDecodeError). "
+            "Attempting partial recovery ..."
+        )
+        recovered = _recover_partial_json_array(response.text)
+        if recovered:
+            log.warning("Recovered %d tool mentions from truncated response.", len(recovered))
+            return recovered
+        log.error("Could not recover any data from truncated response; retrying chunk.")
+        raise  # let tenacity retry
 
 
 # ---------------------------------------------------------------
