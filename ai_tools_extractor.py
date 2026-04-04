@@ -483,10 +483,23 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
     tools_log = _rank_tools_deterministic(all_mentions)
     log.info("Ranked %d tools deterministically by distinct-source count.", len(tools_log))
 
+    # Phase 2b: LLM link fallback — fill "N/A" source_links via the LLM
+    time.sleep(30)  # respect TPM limit before next LLM call
+    log.info("LLM link fallback pass ...")
+    tools_log = _llm_link_fallback(tools_log)
+
+    # Build a fallback URL map from the enriched tools_log so that
+    # _llm_field_tools can use LLM-resolved links too.
+    fallback_urls: dict[str, str] = {}
+    for t in tools_log:
+        link = t.get("source_link", "N/A")
+        if link and link != "N/A":
+            fallback_urls[t["tool_name"].lower()] = link
+
     # Phase 3: LLM categorisation for field tools
     time.sleep(30)  # respect TPM limit before next LLM call
     log.info("LLM field_tools categorisation pass ...")
-    field_tools = _llm_field_tools(all_mentions)
+    field_tools = _llm_field_tools(all_mentions, fallback_urls=fallback_urls)
 
     return {"tools_log": tools_log, "field_tools": field_tools}
 
@@ -666,15 +679,83 @@ def _rank_tools_deterministic(mentions: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------
+# 4b-2. LLM link fallback for tools missing URLs
+# ---------------------------------------------------------------
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=10, max=60))
+def _llm_link_fallback(tools: list[dict]) -> list[dict]:
+    """Ask the LLM to supply homepage URLs for tools that have no link.
+
+    Only tools whose source_link is "N/A" are sent to the LLM.
+    The LLM response is merged back; tools that already have a link are
+    left untouched.  If the LLM cannot confidently determine a URL it
+    should return "N/A" — we never want hallucinated links.
+    """
+    missing = [t for t in tools if t.get("source_link") in ("N/A", "", None)]
+    if not missing:
+        log.info("All tools already have links — skipping LLM link fallback.")
+        return tools
+
+    tool_names = [t["tool_name"] for t in missing]
+    log.info("LLM link fallback: looking up URLs for %d tools …", len(tool_names))
+
+    prompt = textwrap.dedent(f"""\
+        For each AI tool listed below, provide the official homepage URL.
+
+        RULES:
+        - Return ONLY a JSON object mapping each tool name to its URL string.
+        - If you are NOT confident about the correct URL, use "N/A".
+        - Do NOT guess or fabricate URLs. Only provide URLs you are sure about.
+
+        TOOLS:
+        {json.dumps(tool_names)}
+    """)
+
+    model = genai.GenerativeModel(
+        model_name=config.LLM_MODEL,
+        system_instruction=(
+            "Return only a valid JSON object mapping tool names to URL strings. "
+            "No markdown. Use \"N/A\" when unsure."
+        ),
+        generation_config=genai.GenerationConfig(
+            max_output_tokens=4096,
+            temperature=0.0,
+            response_mime_type="application/json",
+        ),
+    )
+    response = model.generate_content(prompt)
+    url_map: dict[str, str] = json.loads(response.text)
+
+    filled = 0
+    for tool in tools:
+        if tool.get("source_link") not in ("N/A", "", None):
+            continue
+        llm_url = url_map.get(tool["tool_name"], "N/A")
+        if llm_url and llm_url != "N/A":
+            tool["source_link"] = llm_url
+            filled += 1
+
+    log.info("LLM link fallback filled %d / %d missing URLs.", filled, len(missing))
+    return tools
+
+
+# ---------------------------------------------------------------
 # 4c. LLM Categorisation for field tools
 # ---------------------------------------------------------------
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=10, max=60))
-def _llm_field_tools(all_mentions: list[dict]) -> list[dict]:
+def _llm_field_tools(
+    all_mentions: list[dict],
+    fallback_urls: dict[str, str] | None = None,
+) -> list[dict]:
     """Assign tools to categories using the LLM.
 
     Builds a summary of all positively-mentioned tools (with distinct source
     counts) and asks the LLM to pick the top 5 per category.
+
+    *fallback_urls* is an optional {tool_name_lower: url} map produced by the
+    LLM link-fallback step; it supplements URLs that were missing from the
+    original article/email content.
     """
+    fallback_urls = fallback_urls or {}
     # Build a deduplicated summary of positive tools with source counts
     tool_info: dict[str, dict] = defaultdict(lambda: {
         "sources": set(), "descriptions": [], "use_cases": [],
@@ -705,7 +786,7 @@ def _llm_field_tools(all_mentions: list[dict]) -> list[dict]:
         name = data["original_name"] or key
         count = len(data["sources"])
         desc = data["descriptions"][0] if data["descriptions"] else "No description"
-        url = data["urls"][0] if data["urls"] else "N/A"
+        url = data["urls"][0] if data["urls"] else fallback_urls.get(key, "N/A")
         # Deduplicate categories
         seen_cats = dict.fromkeys(data["categories"])
         cats_str = "; ".join(seen_cats) if seen_cats else "uncategorized"
