@@ -97,7 +97,7 @@ def get_google_credentials() -> Credentials:
 def fetch_emails(creds: Credentials) -> list[dict]:
     """Fetch emails from Gmail with the configured newsletter label.
 
-    Returns a list of dicts: {"subject": ..., "date": ..., "body": ...}.
+    Returns a list of dicts: {"subject": ..., "date": ..., "from": ..., "body": ...}.
     Only emails from the last config.LOOKBACK_DAYS days are returned.
     """
     service = build("gmail", "v1", credentials=creds)
@@ -148,6 +148,7 @@ def fetch_emails(creds: Credentials) -> list[dict]:
         results.append({
             "subject": headers.get("Subject", ""),
             "date": headers.get("Date", ""),
+            "from": headers.get("From", ""),
             "body": body_text,
         })
 
@@ -281,7 +282,7 @@ def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dic
             "title": title,
             "date": date_str,
             "url": url,
-            "content": content[:15000],  # cap per article to manage total size
+            "content": content[:50000],  # generous cap; chunking logic handles total size
         })
 
     return articles
@@ -369,6 +370,54 @@ def _parse_llm_json(text: str):
     return json.loads(cleaned.strip())
 
 
+def _recover_partial_json_array(text: str) -> list:
+    """Recover as many complete JSON objects as possible from a truncated array.
+
+    When the LLM output is cut off mid-string, we find the last complete
+    object (ending with '}') and close the array so we salvage valid data
+    rather than discarding the entire chunk.
+    """
+    start = text.find("[")
+    if start == -1:
+        return []
+    # Walk backward from the end to find the last complete object boundary
+    for end_marker in ("}\n]", "},\n", "}, \n", "},", "}"):
+        pos = text.rfind(end_marker, start)
+        if pos != -1:
+            candidate = text[start : pos + 1] + "]"
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+    return []
+
+
+def _canonical_source(raw_identifier: str) -> str:
+    """Map a raw domain or email address to its canonical provider name.
+
+    Looks up config.SOURCE_MAPPING first.  Falls back to the raw identifier
+    so new / unknown providers still get tracked (just without dedup).
+    """
+    # Direct lookup (covers archive domains and known email addresses)
+    if raw_identifier in config.SOURCE_MAPPING:
+        return config.SOURCE_MAPPING[raw_identifier]
+    # Fallback: strip common prefixes like "www."
+    stripped = raw_identifier.removeprefix("www.").lower()
+    return config.SOURCE_MAPPING.get(stripped, raw_identifier)
+
+
+def _extract_sender_address(from_header: str) -> str:
+    """Extract the bare email address from a From header.
+
+    Handles formats like:
+      "The Rundown AI <news+canned.response@daily.therundown.ai>"
+      "news@alphasignal.ai"
+    """
+    match = re.search(r"<([^>]+)>", from_header)
+    addr = match.group(1).strip().lower() if match else from_header.strip().lower()
+    return addr or "unknown-sender"
+
+
 def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
     """Send collected content to the LLM and return structured tool data.
 
@@ -379,43 +428,54 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
       2. Python aggregation: deterministic ranking by distinct-source count
       3. LLM categorisation: assign ranked tools to field categories
     """
-    # Build a combined text digest for the LLM
-    digest_parts: list[str] = []
+    # Build one entry per article / email — each entry is a self-contained
+    # unit with its [Source: ...] header so it is never split across chunks.
+    # The [Source: ...] tag uses the CANONICAL provider name so that the
+    # same newsletter scraped from the web and received via Gmail maps to
+    # one provider, not two.
+    entries: list[str] = []
 
     for art in articles:
-        source_name = art["source"].split("/")[2]  # e.g. "www.superhuman.ai"
-        digest_parts.append(
+        domain = art["source"].split("/")[2]  # e.g. "www.superhuman.ai"
+        source_name = _canonical_source(domain)
+        entries.append(
             f"[Source: {source_name}]\nTitle: {art['title']}\n"
             f"Date: {art['date']}\nURL: {art['url']}\n"
-            f"Content:\n{art['content']}\n---\n"
+            f"Content:\n{art['content']}\n---"
         )
 
     for email in emails:
-        # Tag each email by subject so distinct newsletters count as separate sources
-        email_source = f"Gmail - {email['subject']}"
-        digest_parts.append(
-            f"[Source: {email_source}]\n"
+        sender_addr = _extract_sender_address(email.get("from", ""))
+        source_name = _canonical_source(sender_addr)
+        entries.append(
+            f"[Source: {source_name}]\n"
             f"Subject: {email['subject']}\nDate: {email['date']}\n"
-            f"Content:\n{email['body'][:15000]}\n---\n"
+            f"Content:\n{email['body'][:50000]}\n---"
         )
 
-    # Split into chunks of ~300K chars (~75K tokens) to stay within 250K TPM
-    # With 30s waits between calls: ~2 calls/min * ~107K tokens/call = ~214K TPM
-    chunks = _chunk_text("\n".join(digest_parts), max_chars=300_000)
+    log.info("Built %d entries (%d articles + %d emails).",
+             len(entries), len(articles), len(emails))
+
+    # Pack entries into chunks of ~150K chars (~37K tokens).
+    # Each entry stays whole — no article is ever split across chunks.
+    # With 30s waits between calls: ≤2 calls/min × ~100K tokens ≈ 200K TPM
+    # (well under the 250K TPM limit and 10 RPM limit).
+    chunks = _chunk_by_entries(entries, max_chars=150_000)
 
     # Phase 1: extract structured tool mentions from each chunk
     all_mentions: list[dict] = []
     for i, chunk in enumerate(chunks):
-        log.info("LLM extraction pass %d/%d ...", i + 1, len(chunks))
+        log.info("LLM extraction pass %d/%d (%d chars) ...",
+                 i + 1, len(chunks), len(chunk))
         extracted = _llm_extract_tools(chunk)
         if isinstance(extracted, list):
             all_mentions.extend(extracted)
         else:
             log.warning("Extraction pass %d returned non-list; skipping.", i + 1)
         if i < len(chunks) - 1:
-            # Wait a full minute so the previous call's tokens roll off
-            # the 250K TPM window before the next large call.
-            time.sleep(60)
+            # 30s between calls: at ~100K tokens/call this keeps us under
+            # 250K TPM (2 calls/min × 100K = 200K) and well under 10 RPM.
+            time.sleep(30)
 
     log.info("Extracted %d total tool mentions across %d chunks.", len(all_mentions), len(chunks))
 
@@ -424,26 +484,47 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
     log.info("Ranked %d tools deterministically by distinct-source count.", len(tools_log))
 
     # Phase 3: LLM categorisation for field tools
-    time.sleep(60)  # respect TPM limit before next LLM call
+    time.sleep(30)  # respect TPM limit before next LLM call
     log.info("LLM field_tools categorisation pass ...")
     field_tools = _llm_field_tools(all_mentions)
 
     return {"tools_log": tools_log, "field_tools": field_tools}
 
 
-def _chunk_text(text: str, max_chars: int) -> list[str]:
-    """Split text into chunks of approximately max_chars."""
-    if len(text) <= max_chars:
-        return [text]
-    chunks, start = [], 0
-    while start < len(text):
-        end = start + max_chars
-        # Try to split at a paragraph boundary
-        boundary = text.rfind("\n---\n", start, end)
-        if boundary > start:
-            end = boundary + 5
-        chunks.append(text[start:end])
-        start = end
+def _chunk_by_entries(entries: list[str], max_chars: int = 150_000) -> list[str]:
+    """Pack entry strings into chunks, never splitting an entry across chunks.
+
+    Each entry is one complete article or email (with its [Source: ...] header).
+    This guarantees source attribution is always intact and no article is
+    partially analysed.
+    """
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    for entry in entries:
+        entry_len = len(entry)
+        if entry_len > max_chars:
+            # Single entry exceeds chunk size — flush current, then send it alone
+            if current:
+                chunks.append("\n".join(current))
+                current, current_len = [], 0
+            # Truncate as a last resort so we still analyse the beginning
+            chunks.append(entry[:max_chars])
+            log.warning("Single entry (%d chars) exceeds chunk limit; truncated.", entry_len)
+            continue
+
+        if current_len + entry_len + 1 > max_chars:
+            # Current chunk is full — flush and start a new one
+            chunks.append("\n".join(current))
+            current, current_len = [], 0
+
+        current.append(entry)
+        current_len += entry_len + 1  # +1 for the joining newline
+
+    if current:
+        chunks.append("\n".join(current))
+
     return chunks
 
 
@@ -499,7 +580,19 @@ def _llm_extract_tools(text_chunk: str) -> list[dict]:
         ),
     )
     response = model.generate_content(text_chunk)
-    return json.loads(response.text)
+    try:
+        return json.loads(response.text)
+    except json.JSONDecodeError:
+        log.warning(
+            "LLM response appears truncated (JSONDecodeError). "
+            "Attempting partial recovery ..."
+        )
+        recovered = _recover_partial_json_array(response.text)
+        if recovered:
+            log.warning("Recovered %d tool mentions from truncated response.", len(recovered))
+            return recovered
+        log.error("Could not recover any data from truncated response; retrying chunk.")
+        raise  # let tenacity retry
 
 
 # ---------------------------------------------------------------
@@ -671,7 +764,16 @@ def _llm_field_tools(all_mentions: list[dict]) -> list[dict]:
         ),
     )
     response = model.generate_content(prompt)
-    return json.loads(response.text)
+    try:
+        return json.loads(response.text)
+    except json.JSONDecodeError:
+        log.warning("field_tools response truncated; attempting partial recovery ...")
+        recovered = _recover_partial_json_array(response.text)
+        if recovered:
+            log.warning("Recovered %d field_tools entries from truncated response.", len(recovered))
+            return recovered
+        log.error("Could not recover field_tools data; returning empty list.")
+        return []
 
 
 # ===================================================================

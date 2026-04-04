@@ -3,7 +3,7 @@ Configuration constants for the AI Tools Extraction pipeline.
 """
 
 # ---------------------------------------------------------------------------
-# Archive URLs to scrape (last 14 days of content)
+# Archive URLs to scrape (last 21 days of content)
 # ---------------------------------------------------------------------------
 ARCHIVE_URLS = [
     "https://www.superhuman.ai/archive",
@@ -48,10 +48,34 @@ CATEGORIES = [
 ]
 
 # ---------------------------------------------------------------------------
+# Canonical source mapping
+# ---------------------------------------------------------------------------
+# Maps archive-URL domains and email sender addresses to a single canonical
+# provider name so that the same newsletter scraped from the web AND received
+# via Gmail counts as ONE distinct source, not two.
+SOURCE_MAPPING: dict[str, str] = {
+    # Archive URL domains (as returned by url.split("/")[2])
+    "www.superhuman.ai":        "superhuman.ai",
+    "www.therundown.ai":        "therundown.ai",
+    "www.theneurondaily.com":   "theneurondaily.com",
+    "www.mindstream.news":      "mindstream.news",
+    "www.bensbites.com":        "bensbites.com",
+    "importai.substack.com":    "importai.substack.com",
+    # Email sender addresses
+    "bensbites@substack.com":                          "bensbites.com",
+    "importai@substack.com":                           "importai.substack.com",
+    "news+canned.response@daily.therundown.ai":        "therundown.ai",
+    "news@alphasignal.ai":                             "alphasignal.ai",
+    "dan@tldrnewsletter.com":                          "tldrnewsletter.com",
+    "hi@mail.theresanaiforthat.com":                   "theresanaiforthat.com",
+    "theneuron@newsletter.theneurondaily.com":         "theneurondaily.com",
+}
+
+# ---------------------------------------------------------------------------
 # LLM settings
 # ---------------------------------------------------------------------------
 LLM_MODEL = "gemini-2.5-flash"
-LLM_MAX_TOKENS = 32768
+LLM_MAX_TOKENS = 65536  # Gemini 2.5 Flash maximum output tokens
 
 # ---------------------------------------------------------------------------
 # Scraping / time-window settings
