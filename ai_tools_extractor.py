@@ -414,7 +414,8 @@ def _extract_sender_address(from_header: str) -> str:
       "news@alphasignal.ai"
     """
     match = re.search(r"<([^>]+)>", from_header)
-    return match.group(1).strip().lower() if match else from_header.strip().lower()
+    addr = match.group(1).strip().lower() if match else from_header.strip().lower()
+    return addr or "unknown-sender"
 
 
 def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
@@ -763,7 +764,16 @@ def _llm_field_tools(all_mentions: list[dict]) -> list[dict]:
         ),
     )
     response = model.generate_content(prompt)
-    return json.loads(response.text)
+    try:
+        return json.loads(response.text)
+    except json.JSONDecodeError:
+        log.warning("field_tools response truncated; attempting partial recovery ...")
+        recovered = _recover_partial_json_array(response.text)
+        if recovered:
+            log.warning("Recovered %d field_tools entries from truncated response.", len(recovered))
+            return recovered
+        log.error("Could not recover field_tools data; returning empty list.")
+        return []
 
 
 # ===================================================================
