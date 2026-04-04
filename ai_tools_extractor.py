@@ -440,29 +440,35 @@ def _llm_extract_tools(text_chunk: str) -> list[dict]:
     """Ask the LLM to list AI tools mentioned in a text chunk.
 
     Returns a parsed list of dicts with keys:
-    tool_name, source, sentiment, description, url
+    tool_name, source, sentiment, categories, description, url
     """
+    categories_str = ", ".join(f'"{c}"' for c in config.CATEGORIES)
     model = genai.GenerativeModel(
         model_name=config.LLM_MODEL,
-        system_instruction=textwrap.dedent("""            You are an AI-tools analyst. Given newsletter content, extract
+        system_instruction=textwrap.dedent(f"""            You are an AI-tools analyst. Given newsletter content, extract
             every AI tool explicitly mentioned in the provided text.
 
             CRITICAL RULES:
             - ONLY extract tools that are explicitly named in the text below.
             - Do NOT add any tools from your own knowledge or training data.
-            - Do NOT invent or guess URLs. Only include a URL if it literally
-              appears in the text next to the tool mention. Otherwise use "N/A".
             - The "source" field MUST be copied exactly from the nearest
               [Source: ...] header above each article in the text.
             - If a tool is mentioned multiple times in the same source,
               include it only ONCE per source.
+            - "categories" must be determined ONLY from what the source text
+              says about the tool's use cases. Pick one or more from this list:
+              [{categories_str}]
+              If the text describes multiple use cases, include all matching
+              categories. If none clearly match, use the closest one.
 
             For each tool return a JSON object with exactly these keys:
             - "tool_name": the exact name as it appears in the text
             - "source": the source identifier from the [Source: ...] header
             - "sentiment": "positive", "neutral", or "negative"
+            - "categories": array of category strings from the list above
             - "description": 1-sentence summary of what the source says about it
-            - "url": URL of the tool IF found in the text, else "N/A"
+            - "url": URL of the tool if found in the text; otherwise use your
+              knowledge to provide the tool's official website URL
 
             Return a JSON array of objects. Nothing else.
         """),
@@ -490,6 +496,7 @@ def _rank_tools_deterministic(mentions: list[dict]) -> list[dict]:
         "sources": set(),
         "descriptions": [],
         "urls": [],
+        "categories": [],
         "original_name": "",
     })
 
@@ -511,6 +518,10 @@ def _rank_tools_deterministic(mentions: list[dict]) -> list[dict]:
             tool_data[key]["descriptions"].append(m["description"])
         if m.get("url") and m["url"] != "N/A":
             tool_data[key]["urls"].append(m["url"])
+        # Collect categories from each mention
+        for cat in m.get("categories", []):
+            if cat:
+                tool_data[key]["categories"].append(cat)
 
     # Sort: most distinct sources first, alphabetical for ties
     ranked = sorted(
@@ -520,9 +531,14 @@ def _rank_tools_deterministic(mentions: list[dict]) -> list[dict]:
 
     result = []
     for key, data in ranked[:25]:
+        # Deduplicate categories preserving order by frequency (most common first)
+        seen = {}
+        for cat in data["categories"]:
+            seen[cat] = seen.get(cat, 0) + 1
+        unique_cats = sorted(seen.keys(), key=lambda c: -seen[c])
         result.append({
             "tool_name": data["original_name"] or key,
-            "category": "",  # will not be set here; field_tools handles categories
+            "category": ", ".join(unique_cats) if unique_cats else "",
             "mentions": len(data["sources"]),
             "description": data["descriptions"][0] if data["descriptions"] else "",
             "source_link": data["urls"][0] if data["urls"] else "N/A",
@@ -544,7 +560,7 @@ def _llm_field_tools(all_mentions: list[dict]) -> list[dict]:
     # Build a deduplicated summary of positive tools with source counts
     tool_info: dict[str, dict] = defaultdict(lambda: {
         "sources": set(), "descriptions": [], "urls": [],
-        "original_name": "",
+        "categories": [], "original_name": "",
     })
     for m in all_mentions:
         name = m.get("tool_name", "").strip()
@@ -558,6 +574,9 @@ def _llm_field_tools(all_mentions: list[dict]) -> list[dict]:
             tool_info[key]["descriptions"].append(m["description"])
         if m.get("url") and m["url"] != "N/A":
             tool_info[key]["urls"].append(m["url"])
+        for cat in m.get("categories", []):
+            if cat:
+                tool_info[key]["categories"].append(cat)
 
     # Build text list sorted by source count
     tool_lines = []
@@ -566,8 +585,11 @@ def _llm_field_tools(all_mentions: list[dict]) -> list[dict]:
         count = len(data["sources"])
         desc = data["descriptions"][0] if data["descriptions"] else "No description"
         url = data["urls"][0] if data["urls"] else "N/A"
+        # Deduplicate categories
+        seen_cats = dict.fromkeys(data["categories"])
+        cats_str = "; ".join(seen_cats) if seen_cats else "uncategorized"
         tool_lines.append(
-            f"- {name} | sources: {count} | url: {url} | {desc}"
+            f"- {name} | sources: {count} | url: {url} | categories: {cats_str} | {desc}"
         )
 
     tools_text = "\n".join(tool_lines)
