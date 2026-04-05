@@ -502,17 +502,23 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
     tools_log = _llm_link_fallback(tools_log)
 
     # Build a fallback URL map from the enriched tools_log so that
-    # _llm_field_tools can use LLM-resolved links too.
+    # _rank_field_tools_deterministic can use LLM-resolved links too.
     fallback_urls: dict[str, str] = {}
     for t in tools_log:
         link = t.get("source_link", "N/A")
         if link and link != "N/A":
             fallback_urls[t["tool_name"].lower()] = link
 
-    # Phase 3: LLM categorisation for field tools
-    time.sleep(30)  # respect TPM limit before next LLM call
-    log.info("LLM field_tools categorisation pass ...")
-    field_tools = _llm_field_tools(all_mentions, fallback_urls=fallback_urls)
+    # Phase 3: deterministic Python categorisation for field tools.
+    # Categories per tool come from the per-mention categories (grounded
+    # in the source use-cases by the extraction LLM); rank within each
+    # category is by distinct positive source count, same as tools_log.
+    log.info("Deterministic field_tools categorisation pass ...")
+    field_tools = _rank_field_tools_deterministic(
+        all_mentions, fallback_urls=fallback_urls,
+    )
+    log.info("Built %d field_tools entries across %d categories.",
+             len(field_tools), len(config.CATEGORIES))
 
     return {"tools_log": tools_log, "field_tools": field_tools}
 
@@ -753,17 +759,19 @@ def _llm_link_fallback(tools: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------
-# 4c. LLM Categorisation for field tools
+# 4c. Deterministic Python categorisation for field tools
 # ---------------------------------------------------------------
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=10, max=60))
-def _llm_field_tools(
+def _rank_field_tools_deterministic(
     all_mentions: list[dict],
     fallback_urls: dict[str, str] | None = None,
 ) -> list[dict]:
-    """Assign tools to categories using the LLM.
+    """Assign tools to categories deterministically in Python.
 
-    Builds a summary of all positively-mentioned tools (with distinct source
-    counts) and asks the LLM to pick the top 5 per category.
+    Each tool's categories come from the per-mention `categories` field
+    (which the extraction LLM derived ONLY from the use-cases stated in
+    the scraped articles/emails). Ranking within each category is by the
+    number of distinct positive sources that mentioned the tool, exactly
+    like the Tools Log ranking. The top 5 tools per category are returned.
 
     *fallback_urls* is an optional {tool_name_lower: url} map produced by the
     LLM link-fallback step; it supplements URLs that were missing from the
@@ -794,82 +802,39 @@ def _llm_field_tools(
             if cat:
                 tool_info[key]["categories"].append(cat)
 
-    # Build text list sorted by source count
-    tool_lines = []
-    for key, data in sorted(tool_info.items(), key=lambda x: -len(x[1]["sources"])):
-        name = data["original_name"] or key
-        count = len(data["sources"])
-        desc = data["descriptions"][0] if data["descriptions"] else "No description"
-        url = data["urls"][0] if data["urls"] else fallback_urls.get(key, "N/A")
-        # Deduplicate categories
-        seen_cats = dict.fromkeys(data["categories"])
-        cats_str = "; ".join(seen_cats) if seen_cats else "uncategorized"
-        use_cases_str = "; ".join(data["use_cases"][:5]) if data["use_cases"] else "N/A"
-        tool_lines.append(
-            f"- {name} | sources: {count} | url: {url} | categories: {cats_str} | {desc} | use cases: {use_cases_str}"
-        )
+    # For each category in the fixed list, collect tools whose extracted
+    # categories include it, then rank by distinct positive source count.
+    results: list[dict] = []
+    for category in config.CATEGORIES:
+        candidates = []
+        for key, data in tool_info.items():
+            if category not in set(data["categories"]):
+                continue
+            candidates.append((key, data, len(data["sources"])))
 
-    _configure_gemini(_gemini_api_key_fields)
-    tools_text = "\n".join(tool_lines)
-    categories_str = "\n".join(f"- {c}" for c in config.CATEGORIES)
+        # Sort: most distinct positive sources first, alphabetical for ties
+        candidates.sort(key=lambda x: (-x[2], x[0]))
 
-    prompt = textwrap.dedent(f"""        Below is a list of AI tools extracted from newsletter articles and emails,
-        along with how many distinct sources mentioned them positively.
+        for rank, (key, data, count) in enumerate(candidates[:5], start=1):
+            name = data["original_name"] or key
+            url = data["urls"][0] if data["urls"] else fallback_urls.get(key, "N/A")
+            # why_recommended is built from the use-case evidence extracted
+            # from the source text (already grounded in the scraped JSON).
+            if data["use_cases"]:
+                why = "; ".join(data["use_cases"][:3])
+            elif data["descriptions"]:
+                why = data["descriptions"][0]
+            else:
+                why = "N/A"
+            results.append({
+                "field": category,
+                "rank": rank,
+                "tool_name": name,
+                "why_recommended": why,
+                "url": url,
+            })
 
-        For EACH of the following 12 categories, select the top 5 tools ranked 1-5.
-
-        CATEGORIES:
-        {categories_str}
-
-        CRITICAL RULES:
-        - ONLY select tools from the TOOLS LIST below. Do NOT add any tools
-          from your own knowledge.
-        - Rank by how many distinct sources mentioned the tool positively
-          (the "sources" count). Rank 1 = highest source count for that category.
-        - If fewer than 5 tools fit a category from the list, include only
-          those that fit. Do NOT invent tools to fill slots.
-        - "url" MUST be copied from the TOOLS LIST below. Do NOT invent URLs.
-        - "why_recommended" must be derived from the use-case evidence in the
-          TOOLS LIST below, NOT from your own knowledge or opinion.
-
-        OUTPUT FORMAT (valid JSON array only):
-        [
-          {{
-            "field": "<category name>",
-            "rank": <1-5>,
-            "tool_name": "...",
-            "why_recommended": "1 sentence from the sources.",
-            "url": "https://..."
-          }}
-        ]
-
-        TOOLS LIST:
-        {tools_text}
-    """)
-
-    model = genai.GenerativeModel(
-        model_name=config.LLM_MODEL,
-        system_instruction=(
-            "Return only a valid JSON array. No markdown. "
-            "Only use tools from the provided TOOLS LIST."
-        ),
-        generation_config=genai.GenerationConfig(
-            max_output_tokens=config.LLM_MAX_TOKENS,
-            temperature=0.0,
-            response_mime_type="application/json",
-        ),
-    )
-    response = model.generate_content(prompt)
-    try:
-        return json.loads(response.text)
-    except json.JSONDecodeError:
-        log.warning("field_tools response truncated; attempting partial recovery ...")
-        recovered = _recover_partial_json_array(response.text)
-        if recovered:
-            log.warning("Recovered %d field_tools entries from truncated response.", len(recovered))
-            return recovered
-        log.error("Could not recover field_tools data; returning empty list.")
-        return []
+    return results
 
 
 # ===================================================================
