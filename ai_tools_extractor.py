@@ -8,7 +8,11 @@ categorise AI tools, and writes the results to Google Sheets.
 Usage:
     1. Place your Google OAuth credentials.json in the project root.
     2. Set SPREADSHEET_ID in config.py (or via env var SPREADSHEET_ID).
-    3. Export your Gemini key:  export GEMINI_API_KEY="your-key-here"
+    3. Export your Gemini key(s):
+         export GEMINI_API_KEY="primary-key"                  # required
+         export GEMINI_API_KEY_EXTRACT="phase-1-key"           # optional
+         export GEMINI_API_KEY_FIELDS="phase-3-key"            # optional
+       Phase-specific keys fall back to GEMINI_API_KEY if unset.
     4. Run:  python ai_tools_extractor.py
 """
 
@@ -55,11 +59,20 @@ SCOPES = [
 ]
 
 # ---------------------------------------------------------------------------
-# Configure Gemini API once at module level
+# Gemini API keys
 # ---------------------------------------------------------------------------
+# Separate keys per LLM phase help stay under per-key rate limits.
+# Each phase-specific key falls back to GEMINI_API_KEY (the primary) if unset.
 _gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
-if _gemini_api_key:
-    genai.configure(api_key=_gemini_api_key)
+_gemini_api_key_extract = os.environ.get("GEMINI_API_KEY_EXTRACT", "") or _gemini_api_key
+_gemini_api_key_fields = os.environ.get("GEMINI_API_KEY_FIELDS", "") or _gemini_api_key
+
+
+def _configure_gemini(api_key: str) -> None:
+    """(Re)configure the Gemini SDK to use the given API key."""
+    if not api_key:
+        raise RuntimeError("No Gemini API key available for this phase.")
+    genai.configure(api_key=api_key)
 
 
 # ===================================================================
@@ -538,6 +551,7 @@ def _llm_extract_tools(text_chunk: str) -> list[dict]:
     Returns a parsed list of dicts with keys:
     tool_name, source, sentiment, categories, description, url
     """
+    _configure_gemini(_gemini_api_key_extract)
     categories_str = ", ".join(f'"{c}"' for c in config.CATEGORIES)
     model = genai.GenerativeModel(
         model_name=config.LLM_MODEL,
@@ -714,6 +728,7 @@ def _llm_field_tools(all_mentions: list[dict]) -> list[dict]:
             f"- {name} | sources: {count} | url: {url} | categories: {cats_str} | {desc} | use cases: {use_cases_str}"
         )
 
+    _configure_gemini(_gemini_api_key_fields)
     tools_text = "\n".join(tool_lines)
     categories_str = "\n".join(f"- {c}" for c in config.CATEGORIES)
 
@@ -866,8 +881,11 @@ def main() -> None:
     """Run the full extraction -> analysis -> output pipeline."""
     log.info("=== AI Tools Extraction Pipeline ===")
 
-    if not _gemini_api_key:
-        raise RuntimeError("GEMINI_API_KEY environment variable is not set.")
+    if not _gemini_api_key_extract or not _gemini_api_key_fields:
+        raise RuntimeError(
+            "Gemini API key(s) not set. Set GEMINI_API_KEY (primary) and "
+            "optionally GEMINI_API_KEY_EXTRACT / GEMINI_API_KEY_FIELDS."
+        )
 
     # Step 1: Authenticate
     log.info("Authenticating with Google APIs ...")
