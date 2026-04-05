@@ -95,6 +95,55 @@ def _configure_gemini(api_key: str) -> None:
     genai.configure(api_key=api_key)
 
 
+# ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
+# Each expensive phase persists its result to .checkpoints/<name>.json so that
+# if a later phase crashes (e.g. on a 429) you can re-run without re-paying
+# for the phases that already finished. Checkpoints are keyed by today's UTC
+# date — stale ones from previous runs are ignored automatically.
+CHECKPOINT_DIR = ".checkpoints"
+
+
+def _today_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _checkpoint_path(name: str) -> str:
+    return os.path.join(CHECKPOINT_DIR, f"{name}.json")
+
+
+def _load_checkpoint(name: str):
+    """Return the saved data for *name* if it was written today, else None."""
+    path = _checkpoint_path(name)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        log.warning("Checkpoint %s unreadable (%s); ignoring.", path, exc)
+        return None
+    if payload.get("date") != _today_str():
+        log.info("Checkpoint %s is stale (dated %s); ignoring.",
+                 path, payload.get("date"))
+        return None
+    log.info("Resuming from checkpoint: %s", path)
+    return payload.get("data")
+
+
+def _save_checkpoint(name: str, data) -> None:
+    """Persist *data* to a dated checkpoint file."""
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    path = _checkpoint_path(name)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"date": _today_str(), "data": data}, f)
+        log.info("Saved checkpoint: %s", path)
+    except OSError as exc:
+        log.warning("Failed to save checkpoint %s: %s", path, exc)
+
+
 def _generate_with_key_rotation(keys: list[str], model_factory, prompt):
     """Call ``model_factory().generate_content(prompt)``, rotating through
     *keys* on ``ResourceExhausted`` (HTTP 429).
@@ -534,30 +583,39 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
     chunks = _chunk_by_entries(entries, max_chars=150_000)
 
     # Phase 1: extract structured tool mentions from each chunk
-    all_mentions: list[dict] = []
-    for i, chunk in enumerate(chunks):
-        log.info("LLM extraction pass %d/%d (%d chars) ...",
-                 i + 1, len(chunks), len(chunk))
-        extracted = _llm_extract_tools(chunk)
-        if isinstance(extracted, list):
-            all_mentions.extend(extracted)
-        else:
-            log.warning("Extraction pass %d returned non-list; skipping.", i + 1)
-        if i < len(chunks) - 1:
-            # 30s between calls: at ~100K tokens/call this keeps us under
-            # 250K TPM (2 calls/min × 100K = 200K) and well under 10 RPM.
-            time.sleep(30)
+    all_mentions = _load_checkpoint("phase1_mentions")
+    if all_mentions is None:
+        all_mentions = []
+        for i, chunk in enumerate(chunks):
+            log.info("LLM extraction pass %d/%d (%d chars) ...",
+                     i + 1, len(chunks), len(chunk))
+            extracted = _llm_extract_tools(chunk)
+            if isinstance(extracted, list):
+                all_mentions.extend(extracted)
+            else:
+                log.warning("Extraction pass %d returned non-list; skipping.", i + 1)
+            if i < len(chunks) - 1:
+                # 30s between calls: at ~100K tokens/call this keeps us under
+                # 250K TPM (2 calls/min × 100K = 200K) and well under 10 RPM.
+                time.sleep(30)
+        _save_checkpoint("phase1_mentions", all_mentions)
 
     log.info("Extracted %d total tool mentions across %d chunks.", len(all_mentions), len(chunks))
 
-    # Phase 2: deterministic ranking in Python (no LLM needed)
-    tools_log = _rank_tools_deterministic(all_mentions)
-    log.info("Ranked %d tools deterministically by distinct-source count.", len(tools_log))
+    # Phase 2 + 2b: deterministic ranking + LLM link fallback
+    phase2_cached = _load_checkpoint("phase2_tools_log")
+    if phase2_cached is None:
+        # Phase 2: deterministic ranking in Python (no LLM needed)
+        tools_log = _rank_tools_deterministic(all_mentions)
+        log.info("Ranked %d tools deterministically by distinct-source count.", len(tools_log))
 
-    # Phase 2b: LLM link fallback — fill "N/A" source_links via the LLM
-    time.sleep(30)  # respect TPM limit before next LLM call
-    log.info("LLM link fallback pass ...")
-    tools_log = _llm_link_fallback(tools_log)
+        # Phase 2b: LLM link fallback — fill "N/A" source_links via the LLM
+        time.sleep(30)  # respect TPM limit before next LLM call
+        log.info("LLM link fallback pass ...")
+        tools_log = _llm_link_fallback(tools_log)
+        _save_checkpoint("phase2_tools_log", tools_log)
+    else:
+        tools_log = phase2_cached
 
     # Build a fallback URL map from the enriched tools_log so that
     # _llm_field_tools can use LLM-resolved links too.
@@ -568,9 +626,12 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
             fallback_urls[t["tool_name"].lower()] = link
 
     # Phase 3: LLM categorisation for field tools
-    time.sleep(30)  # respect TPM limit before next LLM call
-    log.info("LLM field_tools categorisation pass ...")
-    field_tools = _llm_field_tools(all_mentions, fallback_urls=fallback_urls)
+    field_tools = _load_checkpoint("phase3_field_tools")
+    if field_tools is None:
+        time.sleep(30)  # respect TPM limit before next LLM call
+        log.info("LLM field_tools categorisation pass ...")
+        field_tools = _llm_field_tools(all_mentions, fallback_urls=fallback_urls)
+        _save_checkpoint("phase3_field_tools", field_tools)
 
     return {"tools_log": tools_log, "field_tools": field_tools}
 
@@ -1048,11 +1109,17 @@ def main() -> None:
     creds = get_google_credentials()
 
     # Step 2: Collect data from both sources
-    log.info("Fetching emails from Gmail ...")
-    emails = fetch_emails(creds)
+    emails = _load_checkpoint("emails")
+    if emails is None:
+        log.info("Fetching emails from Gmail ...")
+        emails = fetch_emails(creds)
+        _save_checkpoint("emails", emails)
 
-    log.info("Scraping newsletter archives ...")
-    articles = scrape_archives()
+    articles = _load_checkpoint("articles")
+    if articles is None:
+        log.info("Scraping newsletter archives ...")
+        articles = scrape_archives()
+        _save_checkpoint("articles", articles)
 
     if not articles and not emails:
         log.warning("No content collected from any source. Exiting.")
