@@ -37,6 +37,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 import google.generativeai as genai
+from google.api_core.exceptions import ResourceExhausted
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 import config
@@ -68,11 +69,68 @@ _gemini_api_key_extract = os.environ.get("GEMINI_API_KEY_EXTRACT", "") or _gemin
 _gemini_api_key_fields = os.environ.get("GEMINI_API_KEY_FIELDS", "") or _gemini_api_key
 
 
+def _unique_keys(*keys: str) -> list[str]:
+    """Return a deduplicated list of non-empty keys, preserving order."""
+    seen: dict[str, None] = {}
+    for k in keys:
+        if k and k not in seen:
+            seen[k] = None
+    return list(seen.keys())
+
+
+# Per-phase key pools. Phases try their preferred key first, then fall back
+# through every other configured key so a 429 on one key doesn't abort the run.
+_phase_keys_extract = _unique_keys(
+    _gemini_api_key_extract, _gemini_api_key_fields, _gemini_api_key
+)
+_phase_keys_fields = _unique_keys(
+    _gemini_api_key_fields, _gemini_api_key_extract, _gemini_api_key
+)
+
+
 def _configure_gemini(api_key: str) -> None:
     """(Re)configure the Gemini SDK to use the given API key."""
     if not api_key:
         raise RuntimeError("No Gemini API key available for this phase.")
     genai.configure(api_key=api_key)
+
+
+def _generate_with_key_rotation(keys: list[str], model_factory, prompt):
+    """Call ``model_factory().generate_content(prompt)``, rotating through
+    *keys* on ``ResourceExhausted`` (HTTP 429).
+
+    ``model_factory`` is a zero-arg callable that returns a configured
+    ``GenerativeModel``. It is called after each key switch, because the
+    model must be rebuilt once ``genai.configure`` has been re-pointed.
+
+    Raises the final ``ResourceExhausted`` if every key is quota-blocked,
+    so the outer ``tenacity`` wrapper can decide whether to back off.
+    """
+    if not keys:
+        raise RuntimeError("No Gemini API keys available.")
+
+    last_exc: Exception | None = None
+    for idx, key in enumerate(keys):
+        _configure_gemini(key)
+        try:
+            model = model_factory()
+            return model.generate_content(prompt)
+        except ResourceExhausted as exc:
+            last_exc = exc
+            remaining = len(keys) - idx - 1
+            if remaining > 0:
+                log.warning(
+                    "Gemini key #%d hit quota (429); rotating to next key "
+                    "(%d remaining).",
+                    idx + 1,
+                    remaining,
+                )
+                continue
+            log.error("All %d Gemini key(s) hit quota (429).", len(keys))
+            raise
+    # Unreachable — the loop either returns or raises.
+    assert last_exc is not None
+    raise last_exc
 
 
 # ===================================================================
@@ -564,11 +622,12 @@ def _llm_extract_tools(text_chunk: str) -> list[dict]:
     Returns a parsed list of dicts with keys:
     tool_name, source, sentiment, categories, description, url
     """
-    _configure_gemini(_gemini_api_key_extract)
     categories_str = ", ".join(f'"{c}"' for c in config.CATEGORIES)
-    model = genai.GenerativeModel(
-        model_name=config.LLM_MODEL,
-        system_instruction=textwrap.dedent(f"""            You are an AI-tools analyst. Given newsletter content, extract
+
+    def _build_model():
+        return genai.GenerativeModel(
+            model_name=config.LLM_MODEL,
+            system_instruction=textwrap.dedent(f"""            You are an AI-tools analyst. Given newsletter content, extract
             every AI tool explicitly mentioned in the provided text.
 
             CRITICAL RULES:
@@ -600,13 +659,16 @@ def _llm_extract_tools(text_chunk: str) -> list[dict]:
 
             Return a JSON array of objects. Nothing else.
         """),
-        generation_config=genai.GenerationConfig(
-            max_output_tokens=config.LLM_MAX_TOKENS,
-            temperature=0.0,
-            response_mime_type="application/json",
-        ),
+            generation_config=genai.GenerationConfig(
+                max_output_tokens=config.LLM_MAX_TOKENS,
+                temperature=0.0,
+                response_mime_type="application/json",
+            ),
+        )
+
+    response = _generate_with_key_rotation(
+        _phase_keys_extract, _build_model, text_chunk
     )
-    response = model.generate_content(text_chunk)
     try:
         return json.loads(response.text)
     except json.JSONDecodeError:
@@ -724,19 +786,23 @@ def _llm_link_fallback(tools: list[dict]) -> list[dict]:
         {json.dumps(tool_names)}
     """)
 
-    model = genai.GenerativeModel(
-        model_name=config.LLM_MODEL,
-        system_instruction=(
-            "Return only a valid JSON object mapping tool names to URL strings. "
-            "No markdown. Use \"N/A\" when unsure."
-        ),
-        generation_config=genai.GenerationConfig(
-            max_output_tokens=4096,
-            temperature=0.0,
-            response_mime_type="application/json",
-        ),
+    def _build_model():
+        return genai.GenerativeModel(
+            model_name=config.LLM_MODEL,
+            system_instruction=(
+                "Return only a valid JSON object mapping tool names to URL strings. "
+                "No markdown. Use \"N/A\" when unsure."
+            ),
+            generation_config=genai.GenerationConfig(
+                max_output_tokens=4096,
+                temperature=0.0,
+                response_mime_type="application/json",
+            ),
+        )
+
+    response = _generate_with_key_rotation(
+        _phase_keys_fields, _build_model, prompt
     )
-    response = model.generate_content(prompt)
     url_map: dict[str, str] = json.loads(response.text)
 
     filled = 0
@@ -809,7 +875,6 @@ def _llm_field_tools(
             f"- {name} | sources: {count} | url: {url} | categories: {cats_str} | {desc} | use cases: {use_cases_str}"
         )
 
-    _configure_gemini(_gemini_api_key_fields)
     tools_text = "\n".join(tool_lines)
     categories_str = "\n".join(f"- {c}" for c in config.CATEGORIES)
 
@@ -847,19 +912,23 @@ def _llm_field_tools(
         {tools_text}
     """)
 
-    model = genai.GenerativeModel(
-        model_name=config.LLM_MODEL,
-        system_instruction=(
-            "Return only a valid JSON array. No markdown. "
-            "Only use tools from the provided TOOLS LIST."
-        ),
-        generation_config=genai.GenerationConfig(
-            max_output_tokens=config.LLM_MAX_TOKENS,
-            temperature=0.0,
-            response_mime_type="application/json",
-        ),
+    def _build_model():
+        return genai.GenerativeModel(
+            model_name=config.LLM_MODEL,
+            system_instruction=(
+                "Return only a valid JSON array. No markdown. "
+                "Only use tools from the provided TOOLS LIST."
+            ),
+            generation_config=genai.GenerationConfig(
+                max_output_tokens=config.LLM_MAX_TOKENS,
+                temperature=0.0,
+                response_mime_type="application/json",
+            ),
+        )
+
+    response = _generate_with_key_rotation(
+        _phase_keys_fields, _build_model, prompt
     )
-    response = model.generate_content(prompt)
     try:
         return json.loads(response.text)
     except json.JSONDecodeError:
@@ -962,11 +1031,17 @@ def main() -> None:
     """Run the full extraction -> analysis -> output pipeline."""
     log.info("=== AI Tools Extraction Pipeline ===")
 
-    if not _gemini_api_key_extract or not _gemini_api_key_fields:
+    if not _phase_keys_extract or not _phase_keys_fields:
         raise RuntimeError(
             "Gemini API key(s) not set. Set GEMINI_API_KEY (primary) and "
             "optionally GEMINI_API_KEY_EXTRACT / GEMINI_API_KEY_FIELDS."
         )
+    log.info(
+        "Gemini key pool: %d distinct key(s) available for rotation.",
+        len(_unique_keys(
+            _gemini_api_key, _gemini_api_key_extract, _gemini_api_key_fields
+        )),
+    )
 
     # Step 1: Authenticate
     log.info("Authenticating with Google APIs ...")
