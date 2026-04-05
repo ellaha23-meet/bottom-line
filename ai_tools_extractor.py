@@ -37,7 +37,6 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 import google.generativeai as genai
-from google.api_core.exceptions import ResourceExhausted
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 import config
@@ -69,117 +68,11 @@ _gemini_api_key_extract = os.environ.get("GEMINI_API_KEY_EXTRACT", "") or _gemin
 _gemini_api_key_fields = os.environ.get("GEMINI_API_KEY_FIELDS", "") or _gemini_api_key
 
 
-def _unique_keys(*keys: str) -> list[str]:
-    """Return a deduplicated list of non-empty keys, preserving order."""
-    seen: dict[str, None] = {}
-    for k in keys:
-        if k and k not in seen:
-            seen[k] = None
-    return list(seen.keys())
-
-
-# Per-phase key pools. Phases try their preferred key first, then fall back
-# through every other configured key so a 429 on one key doesn't abort the run.
-_phase_keys_extract = _unique_keys(
-    _gemini_api_key_extract, _gemini_api_key_fields, _gemini_api_key
-)
-_phase_keys_fields = _unique_keys(
-    _gemini_api_key_fields, _gemini_api_key_extract, _gemini_api_key
-)
-
-
 def _configure_gemini(api_key: str) -> None:
     """(Re)configure the Gemini SDK to use the given API key."""
     if not api_key:
         raise RuntimeError("No Gemini API key available for this phase.")
     genai.configure(api_key=api_key)
-
-
-# ---------------------------------------------------------------------------
-# Checkpointing
-# ---------------------------------------------------------------------------
-# Each expensive phase persists its result to .checkpoints/<name>.json so that
-# if a later phase crashes (e.g. on a 429) you can re-run without re-paying
-# for the phases that already finished. Checkpoints are keyed by today's UTC
-# date — stale ones from previous runs are ignored automatically.
-CHECKPOINT_DIR = ".checkpoints"
-
-
-def _today_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-
-def _checkpoint_path(name: str) -> str:
-    return os.path.join(CHECKPOINT_DIR, f"{name}.json")
-
-
-def _load_checkpoint(name: str):
-    """Return the saved data for *name* if it was written today, else None."""
-    path = _checkpoint_path(name)
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-    except (json.JSONDecodeError, OSError) as exc:
-        log.warning("Checkpoint %s unreadable (%s); ignoring.", path, exc)
-        return None
-    if payload.get("date") != _today_str():
-        log.info("Checkpoint %s is stale (dated %s); ignoring.",
-                 path, payload.get("date"))
-        return None
-    log.info("Resuming from checkpoint: %s", path)
-    return payload.get("data")
-
-
-def _save_checkpoint(name: str, data) -> None:
-    """Persist *data* to a dated checkpoint file."""
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    path = _checkpoint_path(name)
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"date": _today_str(), "data": data}, f)
-        log.info("Saved checkpoint: %s", path)
-    except OSError as exc:
-        log.warning("Failed to save checkpoint %s: %s", path, exc)
-
-
-def _generate_with_key_rotation(keys: list[str], model_factory, prompt):
-    """Call ``model_factory().generate_content(prompt)``, rotating through
-    *keys* on ``ResourceExhausted`` (HTTP 429).
-
-    ``model_factory`` is a zero-arg callable that returns a configured
-    ``GenerativeModel``. It is called after each key switch, because the
-    model must be rebuilt once ``genai.configure`` has been re-pointed.
-
-    Raises the final ``ResourceExhausted`` if every key is quota-blocked,
-    so the outer ``tenacity`` wrapper can decide whether to back off.
-    """
-    if not keys:
-        raise RuntimeError("No Gemini API keys available.")
-
-    last_exc: Exception | None = None
-    for idx, key in enumerate(keys):
-        _configure_gemini(key)
-        try:
-            model = model_factory()
-            return model.generate_content(prompt)
-        except ResourceExhausted as exc:
-            last_exc = exc
-            remaining = len(keys) - idx - 1
-            if remaining > 0:
-                log.warning(
-                    "Gemini key #%d hit quota (429); rotating to next key "
-                    "(%d remaining).",
-                    idx + 1,
-                    remaining,
-                )
-                continue
-            log.error("All %d Gemini key(s) hit quota (429).", len(keys))
-            raise
-    # Unreachable — the loop either returns or raises.
-    assert last_exc is not None
-    raise last_exc
 
 
 # ===================================================================
@@ -583,55 +476,49 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
     chunks = _chunk_by_entries(entries, max_chars=150_000)
 
     # Phase 1: extract structured tool mentions from each chunk
-    all_mentions = _load_checkpoint("phase1_mentions")
-    if all_mentions is None:
-        all_mentions = []
-        for i, chunk in enumerate(chunks):
-            log.info("LLM extraction pass %d/%d (%d chars) ...",
-                     i + 1, len(chunks), len(chunk))
-            extracted = _llm_extract_tools(chunk)
-            if isinstance(extracted, list):
-                all_mentions.extend(extracted)
-            else:
-                log.warning("Extraction pass %d returned non-list; skipping.", i + 1)
-            if i < len(chunks) - 1:
-                # 30s between calls: at ~100K tokens/call this keeps us under
-                # 250K TPM (2 calls/min × 100K = 200K) and well under 10 RPM.
-                time.sleep(30)
-        _save_checkpoint("phase1_mentions", all_mentions)
+    all_mentions: list[dict] = []
+    for i, chunk in enumerate(chunks):
+        log.info("LLM extraction pass %d/%d (%d chars) ...",
+                 i + 1, len(chunks), len(chunk))
+        extracted = _llm_extract_tools(chunk)
+        if isinstance(extracted, list):
+            all_mentions.extend(extracted)
+        else:
+            log.warning("Extraction pass %d returned non-list; skipping.", i + 1)
+        if i < len(chunks) - 1:
+            # 30s between calls: at ~100K tokens/call this keeps us under
+            # 250K TPM (2 calls/min × 100K = 200K) and well under 10 RPM.
+            time.sleep(30)
 
     log.info("Extracted %d total tool mentions across %d chunks.", len(all_mentions), len(chunks))
 
-    # Phase 2 + 2b: deterministic ranking + LLM link fallback
-    phase2_cached = _load_checkpoint("phase2_tools_log")
-    if phase2_cached is None:
-        # Phase 2: deterministic ranking in Python (no LLM needed)
-        tools_log = _rank_tools_deterministic(all_mentions)
-        log.info("Ranked %d tools deterministically by distinct-source count.", len(tools_log))
+    # Phase 2: deterministic ranking in Python (no LLM needed)
+    tools_log = _rank_tools_deterministic(all_mentions)
+    log.info("Ranked %d tools deterministically by distinct-source count.", len(tools_log))
 
-        # Phase 2b: LLM link fallback — fill "N/A" source_links via the LLM
-        time.sleep(30)  # respect TPM limit before next LLM call
-        log.info("LLM link fallback pass ...")
-        tools_log = _llm_link_fallback(tools_log)
-        _save_checkpoint("phase2_tools_log", tools_log)
-    else:
-        tools_log = phase2_cached
+    # Phase 2b: LLM link fallback — fill "N/A" source_links via the LLM
+    time.sleep(30)  # respect TPM limit before next LLM call
+    log.info("LLM link fallback pass ...")
+    tools_log = _llm_link_fallback(tools_log)
 
     # Build a fallback URL map from the enriched tools_log so that
-    # _llm_field_tools can use LLM-resolved links too.
+    # _rank_field_tools_deterministic can use LLM-resolved links too.
     fallback_urls: dict[str, str] = {}
     for t in tools_log:
         link = t.get("source_link", "N/A")
         if link and link != "N/A":
             fallback_urls[t["tool_name"].lower()] = link
 
-    # Phase 3: LLM categorisation for field tools
-    field_tools = _load_checkpoint("phase3_field_tools")
-    if field_tools is None:
-        time.sleep(30)  # respect TPM limit before next LLM call
-        log.info("LLM field_tools categorisation pass ...")
-        field_tools = _llm_field_tools(all_mentions, fallback_urls=fallback_urls)
-        _save_checkpoint("phase3_field_tools", field_tools)
+    # Phase 3: deterministic Python categorisation for field tools.
+    # Categories per tool come from the per-mention categories (grounded
+    # in the source use-cases by the extraction LLM); rank within each
+    # category is by distinct positive source count, same as tools_log.
+    log.info("Deterministic field_tools categorisation pass ...")
+    field_tools = _rank_field_tools_deterministic(
+        all_mentions, fallback_urls=fallback_urls,
+    )
+    log.info("Built %d field_tools entries across %d categories.",
+             len(field_tools), len(config.CATEGORIES))
 
     return {"tools_log": tools_log, "field_tools": field_tools}
 
@@ -683,12 +570,11 @@ def _llm_extract_tools(text_chunk: str) -> list[dict]:
     Returns a parsed list of dicts with keys:
     tool_name, source, sentiment, categories, description, url
     """
+    _configure_gemini(_gemini_api_key_extract)
     categories_str = ", ".join(f'"{c}"' for c in config.CATEGORIES)
-
-    def _build_model():
-        return genai.GenerativeModel(
-            model_name=config.LLM_MODEL,
-            system_instruction=textwrap.dedent(f"""            You are an AI-tools analyst. Given newsletter content, extract
+    model = genai.GenerativeModel(
+        model_name=config.LLM_MODEL,
+        system_instruction=textwrap.dedent(f"""            You are an AI-tools analyst. Given newsletter content, extract
             every AI tool explicitly mentioned in the provided text.
 
             CRITICAL RULES:
@@ -715,21 +601,22 @@ def _llm_extract_tools(text_chunk: str) -> list[dict]:
               text gives no use case)
             - "categories": array of category strings from the list above
             - "description": 1-sentence summary of what the source says about it
-            - "url": URL of the tool if explicitly mentioned in the text,
-              otherwise "N/A"
+            - "url": the tool's OFFICIAL HOMEPAGE URL if it is explicitly
+              present in the text (e.g. "https://toolname.com"). Do NOT
+              return links to newsletter posts, blog articles, Substack/
+              Medium pages, news coverage, YouTube videos, tweets, or any
+              other article-about-the-tool URL. If the text does not
+              contain the tool's own website URL, return "N/A".
 
             Return a JSON array of objects. Nothing else.
         """),
-            generation_config=genai.GenerationConfig(
-                max_output_tokens=config.LLM_MAX_TOKENS,
-                temperature=0.0,
-                response_mime_type="application/json",
-            ),
-        )
-
-    response = _generate_with_key_rotation(
-        _phase_keys_extract, _build_model, text_chunk
+        generation_config=genai.GenerationConfig(
+            max_output_tokens=config.LLM_MAX_TOKENS,
+            temperature=0.0,
+            response_mime_type="application/json",
+        ),
     )
+    response = model.generate_content(text_chunk)
     try:
         return json.loads(response.text)
     except json.JSONDecodeError:
@@ -743,6 +630,68 @@ def _llm_extract_tools(text_chunk: str) -> list[dict]:
             return recovered
         log.error("Could not recover any data from truncated response; retrying chunk.")
         raise  # let tenacity retry
+
+
+# ---------------------------------------------------------------
+# 4a-2. Homepage URL filter
+# ---------------------------------------------------------------
+# Hosting platforms / newsletter services that publish articles ABOUT tools
+# rather than being the tool's own homepage.
+_BLOG_HOSTS = (
+    "substack.com", "medium.com", "beehiiv.com", "wordpress.com",
+    "ghost.io", "ghost.org", "mailchi.mp", "buttondown.email",
+    "convertkit.com", "blogspot.com", "tumblr.com", "hashnode.dev",
+    "dev.to", "hackernoon.com", "techcrunch.com", "theverge.com",
+    "venturebeat.com", "forbes.com", "nytimes.com", "wsj.com",
+    "bloomberg.com", "reuters.com", "cnbc.com", "businessinsider.com",
+    "wired.com", "arstechnica.com", "engadget.com", "mashable.com",
+    "zdnet.com", "cnet.com", "theinformation.com", "axios.com",
+    "semafor.com", "futurism.com", "technologyreview.com",
+    "youtube.com", "youtu.be", "twitter.com", "x.com", "linkedin.com",
+    "facebook.com", "instagram.com", "tiktok.com", "reddit.com",
+    "github.io", "notion.site", "notion.so",
+)
+
+# URL path segments that indicate an article/blog post rather than a homepage.
+_ARTICLE_PATH_MARKERS = (
+    "/p/", "/post/", "/posts/", "/blog/", "/article/", "/articles/",
+    "/newsletter/", "/news/", "/story/", "/stories/", "/i/",
+    "/entry/", "/archive/", "/read/", "/issues/", "/issue-",
+    "/2023/", "/2024/", "/2025/", "/2026/", "/@",
+)
+
+
+def _is_homepage_url(url: str) -> bool:
+    """Return True if *url* looks like a tool homepage rather than an article.
+
+    We reject URLs that live on known newsletter/blog platforms or whose path
+    looks like an article slug.  This is heuristic but conservative: when in
+    doubt we drop the URL and let the LLM fallback supply the real homepage.
+    """
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url.strip())
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return False
+
+    host = parsed.netloc.lower().lstrip("www.")
+    if any(bh in host for bh in _BLOG_HOSTS):
+        return False
+
+    path = parsed.path.lower()
+    if any(marker in path for marker in _ARTICLE_PATH_MARKERS):
+        return False
+
+    # Long slug-like paths are almost certainly article URLs.
+    slug = path.strip("/")
+    if len(slug) > 50 or slug.count("-") >= 4:
+        return False
+
+    return True
 
 
 # ---------------------------------------------------------------
@@ -784,7 +733,7 @@ def _rank_tools_deterministic(mentions: list[dict]) -> list[dict]:
         uc = m.get("use_case", "").strip()
         if uc and uc != "N/A" and uc not in tool_data[key]["use_cases"]:
             tool_data[key]["use_cases"].append(uc)
-        if m.get("url") and m["url"] != "N/A":
+        if m.get("url") and m["url"] != "N/A" and _is_homepage_url(m["url"]):
             tool_data[key]["urls"].append(m["url"])
         # Collect categories from each mention
         for cat in m.get("categories", []):
@@ -836,34 +785,38 @@ def _llm_link_fallback(tools: list[dict]) -> list[dict]:
     log.info("LLM link fallback: looking up URLs for %d tools …", len(tool_names))
 
     prompt = textwrap.dedent(f"""\
-        For each AI tool listed below, provide the official homepage URL.
+        For each AI tool listed below, provide the tool's OFFICIAL HOMEPAGE
+        URL (the tool's own website — the page where a user would sign up
+        for or download the product).
 
         RULES:
         - Return ONLY a JSON object mapping each tool name to its URL string.
-        - If you are NOT confident about the correct URL, use "N/A".
+        - The URL MUST be the tool's own website (e.g. "https://toolname.com"
+          or "https://toolname.ai"), NOT a link to a review, article, blog
+          post, newsletter issue, Wikipedia page, GitHub repo, YouTube
+          video, tweet, or any third-party page ABOUT the tool.
+        - Prefer the root domain (no long paths). Avoid URLs that contain
+          "/blog/", "/post/", "/article/", "/news/" or year segments.
+        - If you are NOT confident about the correct homepage, use "N/A".
         - Do NOT guess or fabricate URLs. Only provide URLs you are sure about.
 
         TOOLS:
         {json.dumps(tool_names)}
     """)
 
-    def _build_model():
-        return genai.GenerativeModel(
-            model_name=config.LLM_MODEL,
-            system_instruction=(
-                "Return only a valid JSON object mapping tool names to URL strings. "
-                "No markdown. Use \"N/A\" when unsure."
-            ),
-            generation_config=genai.GenerationConfig(
-                max_output_tokens=4096,
-                temperature=0.0,
-                response_mime_type="application/json",
-            ),
-        )
-
-    response = _generate_with_key_rotation(
-        _phase_keys_fields, _build_model, prompt
+    model = genai.GenerativeModel(
+        model_name=config.LLM_MODEL,
+        system_instruction=(
+            "Return only a valid JSON object mapping tool names to URL strings. "
+            "No markdown. Use \"N/A\" when unsure."
+        ),
+        generation_config=genai.GenerationConfig(
+            max_output_tokens=4096,
+            temperature=0.0,
+            response_mime_type="application/json",
+        ),
     )
+    response = model.generate_content(prompt)
     url_map: dict[str, str] = json.loads(response.text)
 
     filled = 0
@@ -871,7 +824,7 @@ def _llm_link_fallback(tools: list[dict]) -> list[dict]:
         if tool.get("source_link") not in ("N/A", "", None):
             continue
         llm_url = url_map.get(tool["tool_name"], "N/A")
-        if llm_url and llm_url != "N/A":
+        if llm_url and llm_url != "N/A" and _is_homepage_url(llm_url):
             tool["source_link"] = llm_url
             filled += 1
 
@@ -880,17 +833,19 @@ def _llm_link_fallback(tools: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------
-# 4c. LLM Categorisation for field tools
+# 4c. Deterministic Python categorisation for field tools
 # ---------------------------------------------------------------
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=10, max=60))
-def _llm_field_tools(
+def _rank_field_tools_deterministic(
     all_mentions: list[dict],
     fallback_urls: dict[str, str] | None = None,
 ) -> list[dict]:
-    """Assign tools to categories using the LLM.
+    """Assign tools to categories deterministically in Python.
 
-    Builds a summary of all positively-mentioned tools (with distinct source
-    counts) and asks the LLM to pick the top 5 per category.
+    Each tool's categories come from the per-mention `categories` field
+    (which the extraction LLM derived ONLY from the use-cases stated in
+    the scraped articles/emails). Ranking within each category is by the
+    number of distinct positive sources that mentioned the tool, exactly
+    like the Tools Log ranking. The top 5 tools per category are returned.
 
     *fallback_urls* is an optional {tool_name_lower: url} map produced by the
     LLM link-fallback step; it supplements URLs that were missing from the
@@ -915,91 +870,45 @@ def _llm_field_tools(
         uc = m.get("use_case", "").strip()
         if uc and uc != "N/A" and uc not in tool_info[key]["use_cases"]:
             tool_info[key]["use_cases"].append(uc)
-        if m.get("url") and m["url"] != "N/A":
+        if m.get("url") and m["url"] != "N/A" and _is_homepage_url(m["url"]):
             tool_info[key]["urls"].append(m["url"])
         for cat in m.get("categories", []):
             if cat:
                 tool_info[key]["categories"].append(cat)
 
-    # Build text list sorted by source count
-    tool_lines = []
-    for key, data in sorted(tool_info.items(), key=lambda x: -len(x[1]["sources"])):
-        name = data["original_name"] or key
-        count = len(data["sources"])
-        desc = data["descriptions"][0] if data["descriptions"] else "No description"
-        url = data["urls"][0] if data["urls"] else fallback_urls.get(key, "N/A")
-        # Deduplicate categories
-        seen_cats = dict.fromkeys(data["categories"])
-        cats_str = "; ".join(seen_cats) if seen_cats else "uncategorized"
-        use_cases_str = "; ".join(data["use_cases"][:5]) if data["use_cases"] else "N/A"
-        tool_lines.append(
-            f"- {name} | sources: {count} | url: {url} | categories: {cats_str} | {desc} | use cases: {use_cases_str}"
-        )
+    # For each category in the fixed list, collect tools whose extracted
+    # categories include it, then rank by distinct positive source count.
+    results: list[dict] = []
+    for category in config.CATEGORIES:
+        candidates = []
+        for key, data in tool_info.items():
+            if category not in set(data["categories"]):
+                continue
+            candidates.append((key, data, len(data["sources"])))
 
-    tools_text = "\n".join(tool_lines)
-    categories_str = "\n".join(f"- {c}" for c in config.CATEGORIES)
+        # Sort: most distinct positive sources first, alphabetical for ties
+        candidates.sort(key=lambda x: (-x[2], x[0]))
 
-    prompt = textwrap.dedent(f"""        Below is a list of AI tools extracted from newsletter articles and emails,
-        along with how many distinct sources mentioned them positively.
+        for rank, (key, data, count) in enumerate(candidates[:5], start=1):
+            name = data["original_name"] or key
+            url = data["urls"][0] if data["urls"] else fallback_urls.get(key, "N/A")
+            # why_recommended is built from the use-case evidence extracted
+            # from the source text (already grounded in the scraped JSON).
+            if data["use_cases"]:
+                why = "; ".join(data["use_cases"][:3])
+            elif data["descriptions"]:
+                why = data["descriptions"][0]
+            else:
+                why = "N/A"
+            results.append({
+                "field": category,
+                "rank": rank,
+                "tool_name": name,
+                "why_recommended": why,
+                "url": url,
+            })
 
-        For EACH of the following 12 categories, select the top 5 tools ranked 1-5.
-
-        CATEGORIES:
-        {categories_str}
-
-        CRITICAL RULES:
-        - ONLY select tools from the TOOLS LIST below. Do NOT add any tools
-          from your own knowledge.
-        - Rank by how many distinct sources mentioned the tool positively
-          (the "sources" count). Rank 1 = highest source count for that category.
-        - If fewer than 5 tools fit a category from the list, include only
-          those that fit. Do NOT invent tools to fill slots.
-        - "url" MUST be copied from the TOOLS LIST below. Do NOT invent URLs.
-        - "why_recommended" must be derived from the use-case evidence in the
-          TOOLS LIST below, NOT from your own knowledge or opinion.
-
-        OUTPUT FORMAT (valid JSON array only):
-        [
-          {{
-            "field": "<category name>",
-            "rank": <1-5>,
-            "tool_name": "...",
-            "why_recommended": "1 sentence from the sources.",
-            "url": "https://..."
-          }}
-        ]
-
-        TOOLS LIST:
-        {tools_text}
-    """)
-
-    def _build_model():
-        return genai.GenerativeModel(
-            model_name=config.LLM_MODEL,
-            system_instruction=(
-                "Return only a valid JSON array. No markdown. "
-                "Only use tools from the provided TOOLS LIST."
-            ),
-            generation_config=genai.GenerationConfig(
-                max_output_tokens=config.LLM_MAX_TOKENS,
-                temperature=0.0,
-                response_mime_type="application/json",
-            ),
-        )
-
-    response = _generate_with_key_rotation(
-        _phase_keys_fields, _build_model, prompt
-    )
-    try:
-        return json.loads(response.text)
-    except json.JSONDecodeError:
-        log.warning("field_tools response truncated; attempting partial recovery ...")
-        recovered = _recover_partial_json_array(response.text)
-        if recovered:
-            log.warning("Recovered %d field_tools entries from truncated response.", len(recovered))
-            return recovered
-        log.error("Could not recover field_tools data; returning empty list.")
-        return []
+    return results
 
 
 # ===================================================================
@@ -1092,34 +1001,22 @@ def main() -> None:
     """Run the full extraction -> analysis -> output pipeline."""
     log.info("=== AI Tools Extraction Pipeline ===")
 
-    if not _phase_keys_extract or not _phase_keys_fields:
+    if not _gemini_api_key_extract or not _gemini_api_key_fields:
         raise RuntimeError(
             "Gemini API key(s) not set. Set GEMINI_API_KEY (primary) and "
             "optionally GEMINI_API_KEY_EXTRACT / GEMINI_API_KEY_FIELDS."
         )
-    log.info(
-        "Gemini key pool: %d distinct key(s) available for rotation.",
-        len(_unique_keys(
-            _gemini_api_key, _gemini_api_key_extract, _gemini_api_key_fields
-        )),
-    )
 
     # Step 1: Authenticate
     log.info("Authenticating with Google APIs ...")
     creds = get_google_credentials()
 
     # Step 2: Collect data from both sources
-    emails = _load_checkpoint("emails")
-    if emails is None:
-        log.info("Fetching emails from Gmail ...")
-        emails = fetch_emails(creds)
-        _save_checkpoint("emails", emails)
+    log.info("Fetching emails from Gmail ...")
+    emails = fetch_emails(creds)
 
-    articles = _load_checkpoint("articles")
-    if articles is None:
-        log.info("Scraping newsletter archives ...")
-        articles = scrape_archives()
-        _save_checkpoint("articles", articles)
+    log.info("Scraping newsletter archives ...")
+    articles = scrape_archives()
 
     if not articles and not emails:
         log.warning("No content collected from any source. Exiting.")
