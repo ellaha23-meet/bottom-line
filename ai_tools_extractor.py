@@ -38,6 +38,12 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 import config
 
 # ---------------------------------------------------------------------------
+# Checkpoint file — lets a re-run skip Phase 1/2 and resume at Phase 3
+# after a quota/network failure.
+# ---------------------------------------------------------------------------
+CHECKPOINT_PATH = "analyze_checkpoint.json"
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
@@ -462,33 +468,100 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
     # (well under the 250K TPM limit and 10 RPM limit).
     chunks = _chunk_by_entries(entries, max_chars=150_000)
 
-    # Phase 1: extract structured tool mentions from each chunk
-    all_mentions: list[dict] = []
-    for i, chunk in enumerate(chunks):
-        log.info("LLM extraction pass %d/%d (%d chars) ...",
-                 i + 1, len(chunks), len(chunk))
-        extracted = _llm_extract_tools(chunk)
-        if isinstance(extracted, list):
-            all_mentions.extend(extracted)
-        else:
-            log.warning("Extraction pass %d returned non-list; skipping.", i + 1)
-        if i < len(chunks) - 1:
-            # 30s between calls: at ~100K tokens/call this keeps us under
-            # 250K TPM (2 calls/min × 100K = 200K) and well under 10 RPM.
-            time.sleep(30)
+    # If a checkpoint from a prior run exists, skip Phase 1/2 and resume at Phase 3.
+    checkpoint = _load_checkpoint()
+    if checkpoint is not None:
+        log.info("Resuming from checkpoint '%s' (%d mentions, %d ranked tools). "
+                 "Skipping Phase 1 & 2.",
+                 CHECKPOINT_PATH,
+                 len(checkpoint["all_mentions"]),
+                 len(checkpoint["tools_log"]))
+        all_mentions = checkpoint["all_mentions"]
+        tools_log = checkpoint["tools_log"]
+    else:
+        # Phase 1: extract structured tool mentions from each chunk
+        all_mentions = []
+        for i, chunk in enumerate(chunks):
+            log.info("LLM extraction pass %d/%d (%d chars) ...",
+                     i + 1, len(chunks), len(chunk))
+            extracted = _llm_extract_tools(chunk)
+            if isinstance(extracted, list):
+                all_mentions.extend(extracted)
+            else:
+                log.warning("Extraction pass %d returned non-list; skipping.", i + 1)
+            if i < len(chunks) - 1:
+                # 30s between calls: at ~100K tokens/call this keeps us under
+                # 250K TPM (2 calls/min × 100K = 200K) and well under 10 RPM.
+                time.sleep(30)
 
-    log.info("Extracted %d total tool mentions across %d chunks.", len(all_mentions), len(chunks))
+        log.info("Extracted %d total tool mentions across %d chunks.", len(all_mentions), len(chunks))
 
-    # Phase 2: deterministic ranking in Python (no LLM needed)
-    tools_log = _rank_tools_deterministic(all_mentions)
-    log.info("Ranked %d tools deterministically by distinct-source count.", len(tools_log))
+        # Phase 2: deterministic ranking in Python (no LLM needed)
+        tools_log = _rank_tools_deterministic(all_mentions)
+        log.info("Ranked %d tools deterministically by distinct-source count.", len(tools_log))
 
-    # Phase 3: LLM categorisation for field tools
-    time.sleep(30)  # respect TPM limit before next LLM call
+        # Save checkpoint so Phase 3 can be retried without redoing Phase 1/2.
+        _save_checkpoint(all_mentions, tools_log)
+
+        # Phase 3: LLM categorisation for field tools
+        time.sleep(30)  # respect TPM limit before next LLM call
+
+    # If a separate key is provided for Phase 3 (e.g. the primary key hit
+    # the free-tier daily cap), reconfigure the Gemini client to use it.
+    phase3_key = os.environ.get("GEMINI_API_KEY_PHASE3", "").strip()
+    if phase3_key and phase3_key != _gemini_api_key:
+        log.info("Using separate GEMINI_API_KEY_PHASE3 for Phase 3 call.")
+        genai.configure(api_key=phase3_key)
+
     log.info("LLM field_tools categorisation pass ...")
     field_tools = _llm_field_tools(all_mentions)
 
+    # Phase 3 succeeded — clear the checkpoint.
+    _clear_checkpoint()
+
     return {"tools_log": tools_log, "field_tools": field_tools}
+
+
+def _load_checkpoint() -> dict | None:
+    """Return {'all_mentions': [...], 'tools_log': [...]} if a checkpoint
+    file exists and is valid, else None."""
+    if not os.path.exists(CHECKPOINT_PATH):
+        return None
+    try:
+        with open(CHECKPOINT_PATH, "r") as f:
+            data = json.load(f)
+        if (isinstance(data, dict)
+                and isinstance(data.get("all_mentions"), list)
+                and isinstance(data.get("tools_log"), list)):
+            return data
+        log.warning("Checkpoint file '%s' has unexpected shape; ignoring.",
+                    CHECKPOINT_PATH)
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("Could not read checkpoint '%s': %s; ignoring.",
+                    CHECKPOINT_PATH, e)
+    return None
+
+
+def _save_checkpoint(all_mentions: list[dict], tools_log: list[dict]) -> None:
+    """Persist Phase 1/2 output so Phase 3 can be retried independently."""
+    try:
+        with open(CHECKPOINT_PATH, "w") as f:
+            json.dump({"all_mentions": all_mentions, "tools_log": tools_log},
+                      f, ensure_ascii=False)
+        log.info("Saved checkpoint to '%s' (%d mentions, %d ranked tools).",
+                 CHECKPOINT_PATH, len(all_mentions), len(tools_log))
+    except OSError as e:
+        log.warning("Failed to write checkpoint '%s': %s", CHECKPOINT_PATH, e)
+
+
+def _clear_checkpoint() -> None:
+    """Remove the checkpoint file after a fully successful run."""
+    try:
+        if os.path.exists(CHECKPOINT_PATH):
+            os.remove(CHECKPOINT_PATH)
+            log.info("Cleared checkpoint '%s'.", CHECKPOINT_PATH)
+    except OSError as e:
+        log.warning("Failed to remove checkpoint '%s': %s", CHECKPOINT_PATH, e)
 
 
 def _chunk_by_entries(entries: list[str], max_chars: int = 150_000) -> list[str]:
