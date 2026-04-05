@@ -386,23 +386,49 @@ def _parse_llm_json(text: str):
 def _recover_partial_json_array(text: str) -> list:
     """Recover as many complete JSON objects as possible from a truncated array.
 
-    When the LLM output is cut off mid-string, we find the last complete
-    object (ending with '}') and close the array so we salvage valid data
-    rather than discarding the entire chunk.
+    Walks the text character-by-character while tracking string / escape
+    state so that ``}`` characters appearing inside an unterminated string
+    are not mistaken for object boundaries. We record the position of every
+    top-level complete object inside the array, then rebuild a valid array
+    up to the last one we saw.
     """
     start = text.find("[")
     if start == -1:
         return []
-    # Walk backward from the end to find the last complete object boundary
-    for end_marker in ("}\n]", "},\n", "}, \n", "},", "}"):
-        pos = text.rfind(end_marker, start)
-        if pos != -1:
-            candidate = text[start : pos + 1] + "]"
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
-    return []
+
+    depth = 0           # nesting depth inside the root array ([ = depth 1)
+    in_string = False
+    escape = False
+    last_complete_end = -1  # index of the '}' closing the last top-level object
+
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "[" or ch == "{":
+            depth += 1
+        elif ch == "]" or ch == "}":
+            depth -= 1
+            # A top-level object inside the root array closes when depth
+            # returns to 1 after having been deeper.
+            if ch == "}" and depth == 1:
+                last_complete_end = i
+
+    if last_complete_end == -1:
+        return []
+    candidate = text[start : last_complete_end + 1] + "]"
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        return []
 
 
 def _canonical_source(raw_identifier: str) -> str:
