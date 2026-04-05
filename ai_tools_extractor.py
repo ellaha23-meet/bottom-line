@@ -595,8 +595,12 @@ def _llm_extract_tools(text_chunk: str) -> list[dict]:
               text gives no use case)
             - "categories": array of category strings from the list above
             - "description": 1-sentence summary of what the source says about it
-            - "url": URL of the tool if explicitly mentioned in the text,
-              otherwise "N/A"
+            - "url": the tool's OFFICIAL HOMEPAGE URL if it is explicitly
+              present in the text (e.g. "https://toolname.com"). Do NOT
+              return links to newsletter posts, blog articles, Substack/
+              Medium pages, news coverage, YouTube videos, tweets, or any
+              other article-about-the-tool URL. If the text does not
+              contain the tool's own website URL, return "N/A".
 
             Return a JSON array of objects. Nothing else.
         """),
@@ -620,6 +624,68 @@ def _llm_extract_tools(text_chunk: str) -> list[dict]:
             return recovered
         log.error("Could not recover any data from truncated response; retrying chunk.")
         raise  # let tenacity retry
+
+
+# ---------------------------------------------------------------
+# 4a-2. Homepage URL filter
+# ---------------------------------------------------------------
+# Hosting platforms / newsletter services that publish articles ABOUT tools
+# rather than being the tool's own homepage.
+_BLOG_HOSTS = (
+    "substack.com", "medium.com", "beehiiv.com", "wordpress.com",
+    "ghost.io", "ghost.org", "mailchi.mp", "buttondown.email",
+    "convertkit.com", "blogspot.com", "tumblr.com", "hashnode.dev",
+    "dev.to", "hackernoon.com", "techcrunch.com", "theverge.com",
+    "venturebeat.com", "forbes.com", "nytimes.com", "wsj.com",
+    "bloomberg.com", "reuters.com", "cnbc.com", "businessinsider.com",
+    "wired.com", "arstechnica.com", "engadget.com", "mashable.com",
+    "zdnet.com", "cnet.com", "theinformation.com", "axios.com",
+    "semafor.com", "futurism.com", "technologyreview.com",
+    "youtube.com", "youtu.be", "twitter.com", "x.com", "linkedin.com",
+    "facebook.com", "instagram.com", "tiktok.com", "reddit.com",
+    "github.io", "notion.site", "notion.so",
+)
+
+# URL path segments that indicate an article/blog post rather than a homepage.
+_ARTICLE_PATH_MARKERS = (
+    "/p/", "/post/", "/posts/", "/blog/", "/article/", "/articles/",
+    "/newsletter/", "/news/", "/story/", "/stories/", "/i/",
+    "/entry/", "/archive/", "/read/", "/issues/", "/issue-",
+    "/2023/", "/2024/", "/2025/", "/2026/", "/@",
+)
+
+
+def _is_homepage_url(url: str) -> bool:
+    """Return True if *url* looks like a tool homepage rather than an article.
+
+    We reject URLs that live on known newsletter/blog platforms or whose path
+    looks like an article slug.  This is heuristic but conservative: when in
+    doubt we drop the URL and let the LLM fallback supply the real homepage.
+    """
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url.strip())
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return False
+
+    host = parsed.netloc.lower().lstrip("www.")
+    if any(bh in host for bh in _BLOG_HOSTS):
+        return False
+
+    path = parsed.path.lower()
+    if any(marker in path for marker in _ARTICLE_PATH_MARKERS):
+        return False
+
+    # Long slug-like paths are almost certainly article URLs.
+    slug = path.strip("/")
+    if len(slug) > 50 or slug.count("-") >= 4:
+        return False
+
+    return True
 
 
 # ---------------------------------------------------------------
@@ -661,7 +727,7 @@ def _rank_tools_deterministic(mentions: list[dict]) -> list[dict]:
         uc = m.get("use_case", "").strip()
         if uc and uc != "N/A" and uc not in tool_data[key]["use_cases"]:
             tool_data[key]["use_cases"].append(uc)
-        if m.get("url") and m["url"] != "N/A":
+        if m.get("url") and m["url"] != "N/A" and _is_homepage_url(m["url"]):
             tool_data[key]["urls"].append(m["url"])
         # Collect categories from each mention
         for cat in m.get("categories", []):
@@ -713,11 +779,19 @@ def _llm_link_fallback(tools: list[dict]) -> list[dict]:
     log.info("LLM link fallback: looking up URLs for %d tools …", len(tool_names))
 
     prompt = textwrap.dedent(f"""\
-        For each AI tool listed below, provide the official homepage URL.
+        For each AI tool listed below, provide the tool's OFFICIAL HOMEPAGE
+        URL (the tool's own website — the page where a user would sign up
+        for or download the product).
 
         RULES:
         - Return ONLY a JSON object mapping each tool name to its URL string.
-        - If you are NOT confident about the correct URL, use "N/A".
+        - The URL MUST be the tool's own website (e.g. "https://toolname.com"
+          or "https://toolname.ai"), NOT a link to a review, article, blog
+          post, newsletter issue, Wikipedia page, GitHub repo, YouTube
+          video, tweet, or any third-party page ABOUT the tool.
+        - Prefer the root domain (no long paths). Avoid URLs that contain
+          "/blog/", "/post/", "/article/", "/news/" or year segments.
+        - If you are NOT confident about the correct homepage, use "N/A".
         - Do NOT guess or fabricate URLs. Only provide URLs you are sure about.
 
         TOOLS:
@@ -744,7 +818,7 @@ def _llm_link_fallback(tools: list[dict]) -> list[dict]:
         if tool.get("source_link") not in ("N/A", "", None):
             continue
         llm_url = url_map.get(tool["tool_name"], "N/A")
-        if llm_url and llm_url != "N/A":
+        if llm_url and llm_url != "N/A" and _is_homepage_url(llm_url):
             tool["source_link"] = llm_url
             filled += 1
 
@@ -788,7 +862,7 @@ def _llm_field_tools(
         uc = m.get("use_case", "").strip()
         if uc and uc != "N/A" and uc not in tool_info[key]["use_cases"]:
             tool_info[key]["use_cases"].append(uc)
-        if m.get("url") and m["url"] != "N/A":
+        if m.get("url") and m["url"] != "N/A" and _is_homepage_url(m["url"]):
             tool_info[key]["urls"].append(m["url"])
         for cat in m.get("categories", []):
             if cat:
