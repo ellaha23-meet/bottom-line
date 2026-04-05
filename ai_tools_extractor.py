@@ -479,6 +479,12 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
         all_mentions = checkpoint["all_mentions"]
         tools_log = checkpoint["tools_log"]
     else:
+        # If a separate key is provided for Phase 1, use it now.
+        phase1_key = os.environ.get("GEMINI_API_KEY_PHASE1", "").strip()
+        if phase1_key and phase1_key != _gemini_api_key:
+            log.info("Using separate GEMINI_API_KEY_PHASE1 for Phase 1 calls.")
+            genai.configure(api_key=phase1_key)
+
         # Phase 1: extract structured tool mentions from each chunk
         all_mentions = []
         for i, chunk in enumerate(chunks):
@@ -502,6 +508,10 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
 
         # Save checkpoint so Phase 3 can be retried without redoing Phase 1/2.
         _save_checkpoint(all_mentions, tools_log)
+
+        # Restore primary key before Phase 3 (which has its own override below).
+        if phase1_key and phase1_key != _gemini_api_key:
+            genai.configure(api_key=_gemini_api_key)
 
         # Phase 3: LLM categorisation for field tools
         time.sleep(30)  # respect TPM limit before next LLM call
