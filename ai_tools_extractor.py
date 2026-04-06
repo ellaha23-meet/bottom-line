@@ -205,7 +205,7 @@ def _fetch_page(url: str, page) -> str:
 
 
 def scrape_archives() -> list[dict]:
-    """Scrape all configured archive URLs for posts from the last 21 days.
+    """Scrape all configured archive URLs for posts from the last 17 days.
 
     Returns a list of dicts: {"source": ..., "title": ..., "date": ...,
     "url": ..., "content": ...}.
@@ -405,18 +405,48 @@ def _recover_partial_json_array(text: str) -> list:
     return []
 
 
+# Pre-build a lookup for fast category normalisation
+_CATEGORY_LOOKUP: dict[str, str] = {c.strip().lower(): c for c in config.CATEGORIES}
+
+
+def _normalize_category(raw: str) -> str | None:
+    """Map an LLM-returned category to the closest config.CATEGORIES entry.
+
+    Returns the canonical category string, or None if no match is found.
+    Tries exact match (case-insensitive) first, then substring containment.
+    """
+    raw_lower = raw.strip().lower()
+    if not raw_lower:
+        return None
+    # Exact match (case-insensitive)
+    if raw_lower in _CATEGORY_LOOKUP:
+        return _CATEGORY_LOOKUP[raw_lower]
+    # Substring match: check if one contains the other
+    for valid_lower, valid in _CATEGORY_LOOKUP.items():
+        if raw_lower in valid_lower or valid_lower in raw_lower:
+            return valid
+    return None
+
+
 def _canonical_source(raw_identifier: str) -> str:
     """Map a raw domain or email address to its canonical provider name.
 
     Looks up config.SOURCE_MAPPING first.  Falls back to the raw identifier
     so new / unknown providers still get tracked (just without dedup).
+    Always returns a lowercased canonical name for consistent deduplication.
     """
+    key = raw_identifier.strip().lower()
     # Direct lookup (covers archive domains and known email addresses)
+    if key in config.SOURCE_MAPPING:
+        return config.SOURCE_MAPPING[key].lower()
+    # Try the original casing too (mapping keys may have mixed case)
     if raw_identifier in config.SOURCE_MAPPING:
-        return config.SOURCE_MAPPING[raw_identifier]
+        return config.SOURCE_MAPPING[raw_identifier].lower()
     # Fallback: strip common prefixes like "www."
-    stripped = raw_identifier.removeprefix("www.").lower()
-    return config.SOURCE_MAPPING.get(stripped, raw_identifier)
+    stripped = key.removeprefix("www.")
+    if stripped in config.SOURCE_MAPPING:
+        return config.SOURCE_MAPPING[stripped].lower()
+    return key
 
 
 def _extract_sender_address(from_header: str) -> str:
@@ -488,14 +518,31 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
             all_mentions.extend(extracted)
         else:
             log.warning("Extraction chunk %s returned non-list; skipping.", i)
-        # If the response was truncated, split the chunk in half and
-        # re-queue so we don't lose the tools that were cut off.
+        # If the response was truncated, split the chunk in half at an
+        # entry boundary ("\n---\n") so that [Source: ...] headers stay
+        # attached to their content.  Falls back to a plain newline split
+        # only when no entry boundary exists near the midpoint.
         if truncated:
-            mid = chunk.rfind("\n", 0, len(chunk) // 2)
-            if mid == -1:
-                mid = len(chunk) // 2
-            first_half = chunk[:mid]
-            second_half = chunk[mid:].lstrip("\n")
+            separator = "\n---\n"
+            mid_target = len(chunk) // 2
+            # Search for the nearest entry boundary around the midpoint
+            pos_before = chunk.rfind(separator, 0, mid_target)
+            pos_after = chunk.find(separator, mid_target)
+            if pos_before != -1 and pos_after != -1:
+                # Pick whichever boundary is closer to the true midpoint
+                mid = pos_before if (mid_target - pos_before) <= (pos_after - mid_target) else pos_after
+            elif pos_before != -1:
+                mid = pos_before
+            elif pos_after != -1:
+                mid = pos_after
+            else:
+                # No entry boundary found — fall back to newline split
+                mid = chunk.rfind("\n", 0, mid_target)
+                if mid == -1:
+                    mid = mid_target
+            split_at = mid + len(separator) if chunk[mid:mid + len(separator)] == separator else mid
+            first_half = chunk[:split_at].rstrip("\n")
+            second_half = chunk[split_at:].lstrip("\n")
             if first_half.strip() and second_half.strip():
                 log.info("Splitting truncated chunk %s into two halves "
                          "(%d + %d chars) for re-extraction.",
@@ -743,7 +790,7 @@ def _rank_tools_deterministic(mentions: list[dict]) -> list[dict]:
             continue
 
         key = name.lower()
-        source = m.get("source", "unknown").strip()
+        source = _canonical_source(m.get("source", "unknown"))
         tool_data[key]["sources"].add(source)
         # Keep the first-seen original casing
         if not tool_data[key]["original_name"]:
@@ -756,10 +803,11 @@ def _rank_tools_deterministic(mentions: list[dict]) -> list[dict]:
             tool_data[key]["use_cases"].append(uc)
         if m.get("url") and m["url"] != "N/A" and _is_homepage_url(m["url"]):
             tool_data[key]["urls"].append(m["url"])
-        # Collect categories from each mention
+        # Collect categories from each mention, normalised to config list
         for cat in m.get("categories", []):
-            if cat:
-                tool_data[key]["categories"].append(cat)
+            normalised = _normalize_category(cat) if cat else None
+            if normalised:
+                tool_data[key]["categories"].append(normalised)
 
     # Sort: most distinct sources first, alphabetical for ties
     ranked = sorted(
@@ -883,7 +931,7 @@ def _rank_field_tools_deterministic(
         if not name or m.get("sentiment", "").lower() != "positive":
             continue
         key = name.lower()
-        tool_info[key]["sources"].add(m.get("source", ""))
+        tool_info[key]["sources"].add(_canonical_source(m.get("source", "")))
         if not tool_info[key]["original_name"]:
             tool_info[key]["original_name"] = name
         if m.get("description"):
@@ -894,8 +942,9 @@ def _rank_field_tools_deterministic(
         if m.get("url") and m["url"] != "N/A" and _is_homepage_url(m["url"]):
             tool_info[key]["urls"].append(m["url"])
         for cat in m.get("categories", []):
-            if cat:
-                tool_info[key]["categories"].append(cat)
+            normalised = _normalize_category(cat) if cat else None
+            if normalised:
+                tool_info[key]["categories"].append(normalised)
 
     # For each category in the fixed list, collect tools whose extracted
     # categories include it, then rank by distinct positive source count.
