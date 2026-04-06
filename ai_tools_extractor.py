@@ -438,6 +438,67 @@ _CATEGORY_KEYWORDS: dict[str, set[str]] = {
     for c in config.CATEGORIES
 }
 
+# Aliases for common LLM shorthand that won't survive exact/substring/keyword
+# matching (e.g. "coding" doesn't contain "code" as a substring, so it misses
+# "Writing, debugging, and explaining code" without this mapping).
+_CATEGORY_ALIASES: dict[str, str] = {
+    # Coding-related
+    "coding":                   "Writing, debugging, and explaining code",
+    "programming":              "Writing, debugging, and explaining code",
+    "code generation":          "Writing, debugging, and explaining code",
+    "software development":     "Writing, debugging, and explaining code",
+    "coding assistance":        "Writing, debugging, and explaining code",
+    "developer tools":          "Writing, debugging, and explaining code",
+    # Research-related
+    "research":                 "Researching and synthesizing information",
+    "information retrieval":    "Researching and synthesizing information",
+    "web search":               "Researching and synthesizing information",
+    # Writing-related
+    "writing":                  "Drafting and refining written content",
+    "copywriting":              "Drafting and refining written content",
+    "content creation":         "Drafting and refining written content",
+    "content writing":          "Drafting and refining written content",
+    # Summarisation-related
+    "summarization":            "Summarizing documents and meeting transcripts",
+    "summarisation":            "Summarizing documents and meeting transcripts",
+    "summarizing":              "Summarizing documents and meeting transcripts",
+    "meeting notes":            "Summarizing documents and meeting transcripts",
+    # Data-related
+    "data analysis":            "Analyzing and visualizing complex data",
+    "analytics":                "Analyzing and visualizing complex data",
+    "data visualization":       "Analyzing and visualizing complex data",
+    # Media-related
+    "image generation":         "Generating and editing images, videos, and audio",
+    "video generation":         "Generating and editing images, videos, and audio",
+    "audio generation":         "Generating and editing images, videos, and audio",
+    "image editing":            "Generating and editing images, videos, and audio",
+    "media generation":         "Generating and editing images, videos, and audio",
+    # Automation-related
+    "automation":               "Automating multi-step tasks (Agentic workflows)",
+    "agentic":                  "Automating multi-step tasks (Agentic workflows)",
+    "ai agents":                "Automating multi-step tasks (Agentic workflows)",
+    "workflow automation":      "Automating multi-step tasks (Agentic workflows)",
+    # Translation-related
+    "translation":              "Translating languages and practicing conversation",
+    "language learning":        "Translating languages and practicing conversation",
+    # Brainstorming-related
+    "brainstorming":            "Brainstorming and creative ideation",
+    "ideation":                 "Brainstorming and creative ideation",
+    "creative writing":         "Brainstorming and creative ideation",
+    # Scheduling-related
+    "scheduling":               "Managing schedules and professional correspondence",
+    "email":                    "Managing schedules and professional correspondence",
+    "calendar":                 "Managing schedules and professional correspondence",
+    # Learning-related
+    "learning":                 "Learning and studying",
+    "education":                "Learning and studying",
+    "tutoring":                 "Learning and studying",
+    # Slides-related
+    "presentations":            "Slides preparation",
+    "slide creation":           "Slides preparation",
+    "slide deck":               "Slides preparation",
+}
+
 
 def _normalize_category(raw: str) -> str | None:
     """Map an LLM-returned category to the closest config.CATEGORIES entry.
@@ -452,6 +513,9 @@ def _normalize_category(raw: str) -> str | None:
     # Exact match (case-insensitive)
     if raw_lower in _CATEGORY_LOOKUP:
         return _CATEGORY_LOOKUP[raw_lower]
+    # Alias match: common LLM shorthands that won't survive substring/keyword
+    if raw_lower in _CATEGORY_ALIASES:
+        return _CATEGORY_ALIASES[raw_lower]
     # Substring match: check if one contains the other
     for valid_lower, valid in _CATEGORY_LOOKUP.items():
         if raw_lower in valid_lower or valid_lower in raw_lower:
