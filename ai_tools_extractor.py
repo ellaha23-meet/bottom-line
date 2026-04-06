@@ -1028,17 +1028,23 @@ def _rank_field_tools_deterministic(
     Each tool's categories come from the per-mention `categories` field
     (which the extraction LLM derived ONLY from the use-cases stated in
     the scraped articles/emails). Ranking within each category is by the
-    number of distinct positive sources that mentioned the tool, exactly
-    like the Tools Log ranking. The top 5 tools per category are returned.
+    number of distinct positive sources that mentioned the tool *for that
+    specific category*, so a tool's score in the "coding" category only
+    counts sources that described it as useful for coding. The top 5 tools
+    per category are returned.
 
     *fallback_urls* is an optional {tool_name_lower: url} map produced by the
     LLM link-fallback step; it supplements URLs that were missing from the
     original article/email content.
     """
     fallback_urls = fallback_urls or {}
-    # Build a deduplicated summary of positive tools with source counts
+    # Build a deduplicated summary of positive tools with per-category
+    # source counts.  ``sources_by_cat`` tracks the distinct canonical
+    # sources that mentioned each tool *for a specific category*, so the
+    # ranking reflects how many sources praised the tool for that use-case.
     tool_info: dict[str, dict] = defaultdict(lambda: {
-        "sources": set(), "descriptions": [], "use_cases": [],
+        "sources_by_cat": defaultdict(set),
+        "descriptions": [], "use_cases": [],
         "urls": [], "categories": [], "original_name": "",
     })
     for m in all_mentions:
@@ -1046,7 +1052,7 @@ def _rank_field_tools_deterministic(
         if not name or m.get("sentiment", "").lower() != "positive":
             continue
         key = name.lower()
-        tool_info[key]["sources"].add(_canonical_source(m.get("source", "")))
+        source = _canonical_source(m.get("source", ""))
         if not tool_info[key]["original_name"]:
             tool_info[key]["original_name"] = name
         if m.get("description"):
@@ -1060,16 +1066,19 @@ def _rank_field_tools_deterministic(
             normalised = _normalize_category(cat) if cat else None
             if normalised:
                 tool_info[key]["categories"].append(normalised)
+                tool_info[key]["sources_by_cat"][normalised].add(source)
 
     # For each category in the fixed list, collect tools whose extracted
-    # categories include it, then rank by distinct positive source count.
+    # categories include it, then rank by distinct positive sources
+    # *for that specific category*.
     results: list[dict] = []
     for category in config.CATEGORIES:
         candidates = []
         for key, data in tool_info.items():
             if category not in set(data["categories"]):
                 continue
-            candidates.append((key, data, len(data["sources"])))
+            cat_count = len(data["sources_by_cat"].get(category, set()))
+            candidates.append((key, data, cat_count))
 
         # Sort: most distinct positive sources first, alphabetical for ties
         candidates.sort(key=lambda x: (-x[2], x[0]))
