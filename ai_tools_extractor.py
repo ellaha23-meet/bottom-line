@@ -469,18 +469,22 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
     log.info("Built %d entries (%d articles + %d emails).",
              len(entries), len(articles), len(emails))
 
-    # Pack entries into chunks of ~150K chars (~37K tokens).
+    # Pack entries into chunks of ~100K chars (~25K tokens).
     # Each entry stays whole — no article is ever split across chunks.
-    # With 30s waits between calls: ≤2 calls/min × ~100K tokens ≈ 200K TPM
-    # (well under the 250K TPM limit and 10 RPM limit).
-    chunks = _chunk_by_entries(entries, max_chars=150_000)
+    # Smaller chunks reduce the risk of LLM output truncation.
+    chunks = _chunk_by_entries(entries, max_chars=100_000)
 
     # Phase 1: extract structured tool mentions from each chunk
     all_mentions: list[dict] = []
     for i, chunk in enumerate(chunks):
         log.info("LLM extraction pass %d/%d (%d chars) ...",
                  i + 1, len(chunks), len(chunk))
-        extracted = _llm_extract_tools(chunk)
+        try:
+            extracted = _llm_extract_tools(chunk)
+        except Exception:
+            log.error("Extraction pass %d/%d failed after retries; skipping chunk.",
+                      i + 1, len(chunks))
+            extracted = []
         if isinstance(extracted, list):
             all_mentions.extend(extracted)
         else:
@@ -499,7 +503,10 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
     # Phase 2b: LLM link fallback — fill "N/A" source_links via the LLM
     time.sleep(30)  # respect TPM limit before next LLM call
     log.info("LLM link fallback pass ...")
-    tools_log = _llm_link_fallback(tools_log)
+    try:
+        tools_log = _llm_link_fallback(tools_log)
+    except Exception:
+        log.error("LLM link fallback failed after retries; continuing with existing links.")
 
     # Build a fallback URL map from the enriched tools_log so that
     # _rank_field_tools_deterministic can use LLM-resolved links too.
