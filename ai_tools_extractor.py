@@ -469,10 +469,9 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
     log.info("Built %d entries (%d articles + %d emails).",
              len(entries), len(articles), len(emails))
 
-    # Pack entries into chunks of ~100K chars (~25K tokens).
+    # Pack entries into chunks of ~150K chars (~37K tokens).
     # Each entry stays whole — no article is ever split across chunks.
-    # Smaller chunks reduce the risk of LLM output truncation.
-    chunks = _chunk_by_entries(entries, max_chars=100_000)
+    chunks = _chunk_by_entries(entries, max_chars=150_000)
 
     # Phase 1: extract structured tool mentions from each chunk
     all_mentions: list[dict] = []
