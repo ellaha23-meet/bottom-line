@@ -633,9 +633,9 @@ def _llm_extract_tools(text_chunk: str) -> list[dict]:
         recovered = _recover_partial_json_array(response.text)
         if recovered:
             log.warning("Recovered %d tool mentions from truncated response.", len(recovered))
-            return recovered
-        log.error("Could not recover any data from truncated response; retrying chunk.")
-        raise  # let tenacity retry
+        else:
+            log.error("Could not recover any data from truncated response.")
+        return recovered
 
 
 # ---------------------------------------------------------------
