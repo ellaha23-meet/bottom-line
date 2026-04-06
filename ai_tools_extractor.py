@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+from urllib.parse import urlparse
 import textwrap
 import time
 from collections import defaultdict
@@ -187,10 +188,11 @@ def _extract_email_body(payload: dict) -> str:
                     if mime == "text/html":
                         return BeautifulSoup(decoded, "html.parser").get_text(separator="\n")
                     return decoded
-            # Handle nested multipart
-            nested = _extract_email_body(part)
-            if nested:
-                return nested
+            # Only recurse into multipart containers, not leaf parts
+            if part.get("mimeType", "").startswith("multipart/"):
+                nested = _extract_email_body(part)
+                if nested:
+                    return nested
     return ""
 
 
@@ -408,12 +410,20 @@ def _recover_partial_json_array(text: str) -> list:
 # Pre-build a lookup for fast category normalisation
 _CATEGORY_LOOKUP: dict[str, str] = {c.strip().lower(): c for c in config.CATEGORIES}
 
+# Keyword sets per category for fuzzy matching when exact/substring fails
+_CATEGORY_KEYWORDS: dict[str, set[str]] = {
+    c: set(c.lower().replace("(", "").replace(")", "").replace(",", "").split())
+    - {"and", "or", "the", "a", "an", "for", "of", "in", "to"}
+    for c in config.CATEGORIES
+}
+
 
 def _normalize_category(raw: str) -> str | None:
     """Map an LLM-returned category to the closest config.CATEGORIES entry.
 
     Returns the canonical category string, or None if no match is found.
-    Tries exact match (case-insensitive) first, then substring containment.
+    Tries exact match (case-insensitive) first, then substring containment,
+    then keyword overlap scoring.
     """
     raw_lower = raw.strip().lower()
     if not raw_lower:
@@ -425,6 +435,20 @@ def _normalize_category(raw: str) -> str | None:
     for valid_lower, valid in _CATEGORY_LOOKUP.items():
         if raw_lower in valid_lower or valid_lower in raw_lower:
             return valid
+    # Keyword overlap: pick the category with the most keyword matches
+    raw_words = set(
+        raw_lower.replace("(", "").replace(")", "").replace(",", "").split()
+    ) - {"and", "or", "the", "a", "an", "for", "of", "in", "to"}
+    best_cat = None
+    best_score = 0
+    for cat, keywords in _CATEGORY_KEYWORDS.items():
+        overlap = len(raw_words & keywords)
+        if overlap > best_score:
+            best_score = overlap
+            best_cat = cat
+    # Require at least 2 keyword matches to avoid false positives
+    if best_score >= 2 and best_cat:
+        return best_cat
     return None
 
 
@@ -739,7 +763,6 @@ def _is_homepage_url(url: str) -> bool:
     if not url or not isinstance(url, str):
         return False
     try:
-        from urllib.parse import urlparse
         parsed = urlparse(url.strip())
     except Exception:
         return False
