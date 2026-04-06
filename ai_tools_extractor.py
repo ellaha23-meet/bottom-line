@@ -601,6 +601,24 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
 
     log.info("Extracted %d total tool mentions across %d chunks.", len(all_mentions), len(chunks))
 
+    # Save checkpoint so the ranking/output phases can be re-run without
+    # repeating the expensive LLM extraction step.
+    try:
+        with open(config.MENTIONS_CHECKPOINT, "w", encoding="utf-8") as f:
+            json.dump(all_mentions, f, ensure_ascii=False, indent=2)
+        log.info("Checkpoint saved to %s", config.MENTIONS_CHECKPOINT)
+    except Exception:
+        log.warning("Could not save checkpoint to %s", config.MENTIONS_CHECKPOINT)
+
+    return _rank_and_output(all_mentions)
+
+
+def _rank_and_output(all_mentions: list[dict]) -> dict:
+    """Run the deterministic ranking and URL-fallback phases on *all_mentions*.
+
+    Separated from ``analyze_content`` so the checkpoint path in ``main``
+    can call it directly after loading mentions from disk.
+    """
     # Phase 2: deterministic ranking in Python (no LLM needed)
     tools_log = _rank_tools_deterministic(all_mentions)
     log.info("Ranked %d tools deterministically by distinct-source count.", len(tools_log))
@@ -631,7 +649,7 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
     # Phase 3: deterministic Python categorisation for field tools.
     # Categories per tool come from the per-mention categories (grounded
     # in the source use-cases by the extraction LLM); rank within each
-    # category is by distinct positive source count, same as tools_log.
+    # category is by distinct positive source count per category.
     log.info("Deterministic field_tools categorisation pass ...")
     field_tools = _rank_field_tools_deterministic(
         all_mentions, fallback_urls=fallback_urls,
@@ -1192,7 +1210,15 @@ def _overwrite_rows(service, spreadsheet_id: str, tab_name: str,
 # 6. Main Orchestrator
 # ===================================================================
 def main() -> None:
-    """Run the full extraction -> analysis -> output pipeline."""
+    """Run the full extraction -> analysis -> output pipeline.
+
+    Pass --from-checkpoint as a CLI argument to skip the LLM extraction
+    phase and load all_mentions from the checkpoint file saved by the
+    previous run instead, saving API credits.
+    """
+    import sys
+    from_checkpoint = "--from-checkpoint" in sys.argv
+
     log.info("=== AI Tools Extraction Pipeline ===")
 
     if not _gemini_api_key_extract or not _gemini_api_key_fields:
@@ -1205,24 +1231,32 @@ def main() -> None:
     log.info("Authenticating with Google APIs ...")
     creds = get_google_credentials()
 
-    # Step 2: Collect data from both sources
-    log.info("Fetching emails from Gmail ...")
-    emails = fetch_emails(creds)
+    if from_checkpoint:
+        log.info("--from-checkpoint flag set: loading mentions from %s",
+                 config.MENTIONS_CHECKPOINT)
+        with open(config.MENTIONS_CHECKPOINT, encoding="utf-8") as f:
+            all_mentions = json.load(f)
+        log.info("Loaded %d mentions from checkpoint.", len(all_mentions))
+        data = _rank_and_output(all_mentions)
+    else:
+        # Step 2: Collect data from both sources
+        log.info("Fetching emails from Gmail ...")
+        emails = fetch_emails(creds)
 
-    log.info("Scraping newsletter archives ...")
-    articles = scrape_archives()
+        log.info("Scraping newsletter archives ...")
+        articles = scrape_archives()
 
-    if not articles and not emails:
-        log.warning("No content collected from any source. Exiting.")
-        return
+        if not articles and not emails:
+            log.warning("No content collected from any source. Exiting.")
+            return
 
-    log.info(
-        "Collected %d articles and %d emails. Sending to LLM for analysis ...",
-        len(articles), len(emails),
-    )
+        log.info(
+            "Collected %d articles and %d emails. Sending to LLM for analysis ...",
+            len(articles), len(emails),
+        )
 
-    # Step 3: LLM analysis + deterministic ranking
-    data = analyze_content(articles, emails)
+        # Step 3: LLM analysis + deterministic ranking
+        data = analyze_content(articles, emails)
 
     # Step 4: Write results to Google Sheets
     log.info("Writing results to Google Sheets ...")

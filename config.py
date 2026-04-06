@@ -83,3 +83,12 @@ LLM_MAX_TOKENS = 65536  # Gemini 2.5 Flash maximum output tokens
 LOOKBACK_DAYS = 17
 REQUEST_TIMEOUT = 30  # seconds per HTTP request
 MAX_ARTICLES_PER_SOURCE = 200  # safety cap per archive
+
+# ---------------------------------------------------------------------------
+# Checkpoint file
+# ---------------------------------------------------------------------------
+# After the LLM extraction phase, all_mentions is saved here so you can
+# re-run ranking/output without paying for LLM calls again.
+# Pass --from-checkpoint when running the script to load it instead of
+# re-running the full extraction pipeline.
+MENTIONS_CHECKPOINT = "mentions_checkpoint.json"
