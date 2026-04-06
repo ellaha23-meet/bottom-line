@@ -475,22 +475,36 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
 
     # Phase 1: extract structured tool mentions from each chunk
     all_mentions: list[dict] = []
-    for i, chunk in enumerate(chunks):
-        log.info("LLM extraction pass %d/%d (%d chars) ...",
-                 i + 1, len(chunks), len(chunk))
+    queue = list(enumerate(chunks))  # [(index, chunk_text), ...]
+    while queue:
+        i, chunk = queue.pop(0)
+        log.info("LLM extraction pass (chunk %s, %d chars) ...", i, len(chunk))
         try:
-            extracted = _llm_extract_tools(chunk)
+            extracted, truncated = _llm_extract_tools(chunk)
         except Exception:
-            log.error("Extraction pass %d/%d failed after retries; skipping chunk.",
-                      i + 1, len(chunks))
-            extracted = []
+            log.error("Extraction chunk %s failed after retries; skipping.", i)
+            extracted, truncated = [], False
         if isinstance(extracted, list):
             all_mentions.extend(extracted)
         else:
-            log.warning("Extraction pass %d returned non-list; skipping.", i + 1)
-        if i < len(chunks) - 1:
-            # 30s between calls: at ~100K tokens/call this keeps us under
-            # 250K TPM (2 calls/min × 100K = 200K) and well under 10 RPM.
+            log.warning("Extraction chunk %s returned non-list; skipping.", i)
+        # If the response was truncated, split the chunk in half and
+        # re-queue so we don't lose the tools that were cut off.
+        if truncated:
+            mid = chunk.rfind("\n", 0, len(chunk) // 2)
+            if mid == -1:
+                mid = len(chunk) // 2
+            first_half = chunk[:mid]
+            second_half = chunk[mid:].lstrip("\n")
+            if first_half.strip() and second_half.strip():
+                log.info("Splitting truncated chunk %s into two halves "
+                         "(%d + %d chars) for re-extraction.",
+                         i, len(first_half), len(second_half))
+                queue.insert(0, (f"{i}b", second_half))
+                queue.insert(0, (f"{i}a", first_half))
+                time.sleep(30)
+                continue
+        if queue:
             time.sleep(30)
 
     log.info("Extracted %d total tool mentions across %d chunks.", len(all_mentions), len(chunks))
@@ -570,11 +584,12 @@ def _chunk_by_entries(entries: list[str], max_chars: int = 150_000) -> list[str]
 # 4a. LLM Extraction (structured JSON with source attribution)
 # ---------------------------------------------------------------
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=10, max=60))
-def _llm_extract_tools(text_chunk: str) -> list[dict]:
+def _llm_extract_tools(text_chunk: str) -> tuple[list[dict], bool]:
     """Ask the LLM to list AI tools mentioned in a text chunk.
 
-    Returns a parsed list of dicts with keys:
-    tool_name, source, sentiment, categories, description, url
+    Returns (tools, truncated) where *truncated* is True when the LLM
+    response was cut off.  The caller can then split the chunk and retry
+    the halves to avoid losing data.
     """
     _configure_gemini(_gemini_api_key_extract)
     categories_str = ", ".join(f'"{c}"' for c in config.CATEGORIES)
@@ -624,7 +639,7 @@ def _llm_extract_tools(text_chunk: str) -> list[dict]:
     )
     response = model.generate_content(text_chunk)
     try:
-        return json.loads(response.text, strict=False)
+        return json.loads(response.text, strict=False), False
     except json.JSONDecodeError:
         log.warning(
             "LLM response appears truncated (JSONDecodeError). "
@@ -634,8 +649,8 @@ def _llm_extract_tools(text_chunk: str) -> list[dict]:
         if recovered:
             log.warning("Recovered %d tool mentions from truncated response.", len(recovered))
         else:
-            log.error("Could not recover any data from truncated response.")
-        return recovered
+            log.warning("Could not recover any data from truncated response.")
+        return recovered, True
 
 
 # ---------------------------------------------------------------
