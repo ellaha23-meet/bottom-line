@@ -3,7 +3,7 @@ Configuration constants for the AI Tools Extraction pipeline.
 """
 
 # ---------------------------------------------------------------------------
-# Archive URLs to scrape (last 21 days of content)
+# Archive URLs to scrape (last 17 days of content)
 # ---------------------------------------------------------------------------
 ARCHIVE_URLS = [
     "https://www.superhuman.ai/archive",
@@ -80,6 +80,6 @@ LLM_MAX_TOKENS = 65536  # Gemini 2.5 Flash maximum output tokens
 # ---------------------------------------------------------------------------
 # Scraping / time-window settings
 # ---------------------------------------------------------------------------
-LOOKBACK_DAYS = 21
+LOOKBACK_DAYS = 17
 REQUEST_TIMEOUT = 30  # seconds per HTTP request
 MAX_ARTICLES_PER_SOURCE = 200  # safety cap per archive
