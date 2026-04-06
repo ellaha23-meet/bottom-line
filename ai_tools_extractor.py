@@ -1036,17 +1036,23 @@ def _rank_field_tools_deterministic(
     original article/email content.
     """
     fallback_urls = fallback_urls or {}
-    # Build a deduplicated summary of positive tools with source counts
+    # Build a deduplicated summary of positive tools with per-category source
+    # counts.  `category_sources` maps each category to the set of distinct
+    # sources that mentioned the tool in that category's context, so ranking
+    # within a category reflects category-specific evidence, not the tool's
+    # overall popularity.
     tool_info: dict[str, dict] = defaultdict(lambda: {
         "sources": set(), "descriptions": [], "use_cases": [],
         "urls": [], "categories": [], "original_name": "",
+        "category_sources": defaultdict(set),
     })
     for m in all_mentions:
         name = m.get("tool_name", "").strip()
         if not name or m.get("sentiment", "").lower() != "positive":
             continue
         key = name.lower()
-        tool_info[key]["sources"].add(_canonical_source(m.get("source", "")))
+        source = _canonical_source(m.get("source", ""))
+        tool_info[key]["sources"].add(source)
         if not tool_info[key]["original_name"]:
             tool_info[key]["original_name"] = name
         if m.get("description"):
@@ -1060,16 +1066,19 @@ def _rank_field_tools_deterministic(
             normalised = _normalize_category(cat) if cat else None
             if normalised:
                 tool_info[key]["categories"].append(normalised)
+                tool_info[key]["category_sources"][normalised].add(source)
 
     # For each category in the fixed list, collect tools whose extracted
-    # categories include it, then rank by distinct positive source count.
+    # categories include it, then rank by distinct positive source count
+    # FOR THAT SPECIFIC CATEGORY (not the tool's overall source count).
     results: list[dict] = []
     for category in config.CATEGORIES:
         candidates = []
         for key, data in tool_info.items():
             if category not in set(data["categories"]):
                 continue
-            candidates.append((key, data, len(data["sources"])))
+            cat_count = len(data["category_sources"][category])
+            candidates.append((key, data, cat_count))
 
         # Sort: most distinct positive sources first, alphabetical for ties
         candidates.sort(key=lambda x: (-x[2], x[0]))
@@ -1186,10 +1195,10 @@ def main() -> None:
     """Run the full extraction -> analysis -> output pipeline."""
     log.info("=== AI Tools Extraction Pipeline ===")
 
-    if not _gemini_api_key_extract or not _gemini_api_key_fields:
+    if not _gemini_api_key_extract:
         raise RuntimeError(
-            "Gemini API key(s) not set. Set GEMINI_API_KEY (primary) and "
-            "optionally GEMINI_API_KEY_EXTRACT / GEMINI_API_KEY_FIELDS."
+            "Gemini API key not set. Set GEMINI_API_KEY (primary) and "
+            "optionally GEMINI_API_KEY_EXTRACT for the extraction phase."
         )
 
     # Step 1: Authenticate
