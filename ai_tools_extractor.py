@@ -21,7 +21,7 @@ import json
 import logging
 import os
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 import textwrap
 import time
 from collections import defaultdict
@@ -169,6 +169,27 @@ def fetch_emails(creds: Credentials) -> list[dict]:
     return results
 
 
+def _html_to_text_with_links(html: str) -> str:
+    """Convert HTML to plain text while preserving hyperlinks inline.
+
+    Converts ``<a href="https://example.com">Example</a>`` into
+    ``Example (https://example.com)`` so that the LLM can see and extract
+    tool homepage URLs that are embedded as hyperlinks in newsletter HTML.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for a_tag in soup.find_all("a", href=True):
+        href = a_tag["href"].strip()
+        link_text = a_tag.get_text(strip=True)
+        if href and href.startswith("http"):
+            # Only inline the URL if it differs from the visible text
+            if link_text and href not in link_text:
+                a_tag.replace_with(f"{link_text} ({href})")
+            elif not link_text:
+                a_tag.replace_with(href)
+            # else: link text already contains the URL — leave as-is
+    return soup.get_text(separator="\n")
+
+
 def _extract_email_body(payload: dict) -> str:
     """Recursively extract plain-text (or decoded HTML) from a Gmail payload."""
     parts = payload.get("parts", [])
@@ -178,15 +199,15 @@ def _extract_email_body(payload: dict) -> str:
             return base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
         return ""
 
-    # Prefer text/plain, fall back to text/html
-    for mime in ("text/plain", "text/html"):
+    # Prefer text/html (to preserve hyperlinks), fall back to text/plain
+    for mime in ("text/html", "text/plain"):
         for part in parts:
             if part.get("mimeType") == mime:
                 data = part.get("body", {}).get("data", "")
                 if data:
                     decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
                     if mime == "text/html":
-                        return BeautifulSoup(decoded, "html.parser").get_text(separator="\n")
+                        return _html_to_text_with_links(decoded)
                     return decoded
             # Only recurse into multipart containers, not leaf parts
             if part.get("mimeType", "").startswith("multipart/"):
@@ -287,7 +308,7 @@ def _scrape_single_archive(archive_url: str, cutoff: datetime, page) -> list[dic
                 or page_soup.find("main")
                 or page_soup.find("body")
             )
-            content = article_tag.get_text(separator="\n", strip=True) if article_tag else ""
+            content = _html_to_text_with_links(str(article_tag)) if article_tag else ""
         except Exception:
             log.warning("Could not fetch article: %s", url)
             content = title  # fall back to just the title
@@ -591,6 +612,13 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
         tools_log = _llm_link_fallback(tools_log)
     except Exception:
         log.error("LLM link fallback failed after retries; continuing with existing links.")
+
+    # Phase 2c: web search fallback — free DuckDuckGo search for remaining N/A links
+    log.info("Web search fallback pass ...")
+    try:
+        tools_log = _web_search_link_fallback(tools_log)
+    except Exception:
+        log.error("Web search fallback failed; continuing with existing links.")
 
     # Build a fallback URL map from the enriched tools_log so that
     # _rank_field_tools_deterministic can use LLM-resolved links too.
@@ -921,6 +949,70 @@ def _llm_link_fallback(tools: list[dict]) -> list[dict]:
             filled += 1
 
     log.info("LLM link fallback filled %d / %d missing URLs.", filled, len(missing))
+    return tools
+
+
+# ---------------------------------------------------------------
+# 4b-3. Web search fallback for tools still missing URLs
+# ---------------------------------------------------------------
+def _web_search_link_fallback(tools: list[dict]) -> list[dict]:
+    """Search DuckDuckGo for homepage URLs of tools still missing links.
+
+    Uses plain HTTP requests to DuckDuckGo HTML search — no API key,
+    no LLM request, completely free.  Only fills in a URL when the
+    top result passes the _is_homepage_url() filter.
+    """
+    import requests
+
+    missing = [t for t in tools if t.get("source_link") in ("N/A", "", None)]
+    if not missing:
+        log.info("All tools already have links — skipping web search fallback.")
+        return tools
+
+    log.info("Web search fallback: looking up URLs for %d tools …", len(missing))
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+    filled = 0
+    for tool in missing:
+        name = tool["tool_name"]
+        query = quote_plus(f"{name} AI tool official website")
+        try:
+            resp = requests.get(
+                f"https://html.duckduckgo.com/html/?q={query}",
+                headers=headers,
+                timeout=10,
+            )
+            resp.raise_for_status()
+        except Exception as exc:
+            log.debug("Web search failed for %s: %s", name, exc)
+            continue
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # DuckDuckGo HTML results have class "result__a" for the title links
+        for link in soup.select("a.result__a"):
+            href = link.get("href", "")
+            if not href:
+                continue
+            # DuckDuckGo sometimes wraps URLs in a redirect; extract the real URL
+            if "uddg=" in href:
+                from urllib.parse import parse_qs, urlparse as _urlparse
+                qs = parse_qs(_urlparse(href).query)
+                href = qs.get("uddg", [href])[0]
+            if _is_homepage_url(href):
+                tool["source_link"] = href
+                filled += 1
+                log.debug("Web search found URL for %s: %s", name, href)
+                break
+
+        # Be polite — small delay between searches
+        time.sleep(1)
+
+    log.info("Web search fallback filled %d / %d missing URLs.", filled, len(missing))
     return tools
 
 
