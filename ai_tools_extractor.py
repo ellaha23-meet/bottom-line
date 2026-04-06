@@ -399,7 +399,7 @@ def _recover_partial_json_array(text: str) -> list:
         if pos != -1:
             candidate = text[start : pos + 1] + "]"
             try:
-                return json.loads(candidate)
+                return json.loads(candidate, strict=False)
             except json.JSONDecodeError:
                 continue
     return []
