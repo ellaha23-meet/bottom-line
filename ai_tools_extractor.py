@@ -618,7 +618,7 @@ def _llm_extract_tools(text_chunk: str) -> list[dict]:
     )
     response = model.generate_content(text_chunk)
     try:
-        return json.loads(response.text)
+        return json.loads(response.text, strict=False)
     except json.JSONDecodeError:
         log.warning(
             "LLM response appears truncated (JSONDecodeError). "
