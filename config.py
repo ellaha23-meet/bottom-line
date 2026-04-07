@@ -43,8 +43,8 @@ CATEGORIES = [
     "Brainstorming and creative ideation",
     "Automating multi-step tasks (Agentic workflows)",
     "Managing schedules and professional correspondence",
-    "Slides preparation",
-    "Learning and studying",
+    "UI/UX Design Generation",
+    "Video Editing Workflows",
 ]
 
 # ---------------------------------------------------------------------------

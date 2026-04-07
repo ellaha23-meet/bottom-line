@@ -546,17 +546,17 @@ _CATEGORY_ALIASES: dict[str, str] = {
     "calendar":                 "Managing schedules and professional correspondence",
     "email management":         "Managing schedules and professional correspondence",
     "productivity":             "Managing schedules and professional correspondence",
-    # Learning-related
-    "learning":                 "Learning and studying",
-    "education":                "Learning and studying",
-    "tutoring":                 "Learning and studying",
-    "e-learning":               "Learning and studying",
-    "educational tools":        "Learning and studying",
-    # Slides-related
-    "presentations":            "Slides preparation",
-    "slide creation":           "Slides preparation",
-    "slide deck":               "Slides preparation",
-    "presentation design":      "Slides preparation",
+    # UI/UX Design-related
+    "ui design":                "UI/UX Design Generation",
+    "ux design":                "UI/UX Design Generation",
+    "ui/ux":                    "UI/UX Design Generation",
+    "interface design":         "UI/UX Design Generation",
+    "design generation":        "UI/UX Design Generation",
+    # Video Editing-related
+    "video editing":            "Video Editing Workflows",
+    "video production":         "Video Editing Workflows",
+    "video creation":           "Video Editing Workflows",
+    "video workflow":           "Video Editing Workflows",
 }
 
 
