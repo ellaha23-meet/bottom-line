@@ -449,54 +449,114 @@ _CATEGORY_ALIASES: dict[str, str] = {
     "software development":     "Writing, debugging, and explaining code",
     "coding assistance":        "Writing, debugging, and explaining code",
     "developer tools":          "Writing, debugging, and explaining code",
+    "code interpreter":         "Writing, debugging, and explaining code",
     # Research-related
     "research":                 "Researching and synthesizing information",
     "information retrieval":    "Researching and synthesizing information",
     "web search":               "Researching and synthesizing information",
+    "knowledge retrieval":      "Researching and synthesizing information",
+    "search":                   "Researching and synthesizing information",
     # Writing-related
     "writing":                  "Drafting and refining written content",
     "copywriting":              "Drafting and refining written content",
     "content creation":         "Drafting and refining written content",
     "content writing":          "Drafting and refining written content",
+    "text generation":          "Drafting and refining written content",
     # Summarisation-related
     "summarization":            "Summarizing documents and meeting transcripts",
     "summarisation":            "Summarizing documents and meeting transcripts",
     "summarizing":              "Summarizing documents and meeting transcripts",
     "meeting notes":            "Summarizing documents and meeting transcripts",
+    "transcription":            "Summarizing documents and meeting transcripts",
+    "document summarization":   "Summarizing documents and meeting transcripts",
     # Data-related
     "data analysis":            "Analyzing and visualizing complex data",
     "analytics":                "Analyzing and visualizing complex data",
     "data visualization":       "Analyzing and visualizing complex data",
-    # Media-related
+    "data science":             "Analyzing and visualizing complex data",
+    "data processing":          "Analyzing and visualizing complex data",
+    "advanced data analysis":   "Analyzing and visualizing complex data",
+    "business intelligence":    "Analyzing and visualizing complex data",
+    "charting":                 "Analyzing and visualizing complex data",
+    "data insights":            "Analyzing and visualizing complex data",
+    # Media-related — images
     "image generation":         "Generating and editing images, videos, and audio",
-    "video generation":         "Generating and editing images, videos, and audio",
-    "audio generation":         "Generating and editing images, videos, and audio",
     "image editing":            "Generating and editing images, videos, and audio",
+    "image creation":           "Generating and editing images, videos, and audio",
+    "text to image":            "Generating and editing images, videos, and audio",
+    "text-to-image":            "Generating and editing images, videos, and audio",
+    "ai art":                   "Generating and editing images, videos, and audio",
+    "art generation":           "Generating and editing images, videos, and audio",
+    # Media-related — video
+    "video generation":         "Generating and editing images, videos, and audio",
+    "video creation":           "Generating and editing images, videos, and audio",
+    "video editing":            "Generating and editing images, videos, and audio",
+    "text to video":            "Generating and editing images, videos, and audio",
+    "text-to-video":            "Generating and editing images, videos, and audio",
+    "video synthesis":          "Generating and editing images, videos, and audio",
+    # Media-related — audio / voice / music
+    "audio generation":         "Generating and editing images, videos, and audio",
+    "audio synthesis":          "Generating and editing images, videos, and audio",
+    "voice generation":         "Generating and editing images, videos, and audio",
+    "voice synthesis":          "Generating and editing images, videos, and audio",
+    "voice cloning":            "Generating and editing images, videos, and audio",
+    "text to speech":           "Generating and editing images, videos, and audio",
+    "text-to-speech":           "Generating and editing images, videos, and audio",
+    "tts":                      "Generating and editing images, videos, and audio",
+    "speech synthesis":         "Generating and editing images, videos, and audio",
+    "music generation":         "Generating and editing images, videos, and audio",
+    "music creation":           "Generating and editing images, videos, and audio",
+    "audio editing":            "Generating and editing images, videos, and audio",
+    "sound generation":         "Generating and editing images, videos, and audio",
+    # Media-related — general
     "media generation":         "Generating and editing images, videos, and audio",
+    "multimedia":               "Generating and editing images, videos, and audio",
+    "generative media":         "Generating and editing images, videos, and audio",
+    "media creation":           "Generating and editing images, videos, and audio",
+    "creative tools":           "Generating and editing images, videos, and audio",
     # Automation-related
     "automation":               "Automating multi-step tasks (Agentic workflows)",
     "agentic":                  "Automating multi-step tasks (Agentic workflows)",
     "ai agents":                "Automating multi-step tasks (Agentic workflows)",
     "workflow automation":      "Automating multi-step tasks (Agentic workflows)",
+    "agent framework":          "Automating multi-step tasks (Agentic workflows)",
+    "agent orchestration":      "Automating multi-step tasks (Agentic workflows)",
+    "agentic framework":        "Automating multi-step tasks (Agentic workflows)",
+    "agentic workflows":        "Automating multi-step tasks (Agentic workflows)",
+    "multi-step automation":    "Automating multi-step tasks (Agentic workflows)",
+    "task automation":          "Automating multi-step tasks (Agentic workflows)",
+    "no-code automation":       "Automating multi-step tasks (Agentic workflows)",
+    "ai orchestration":         "Automating multi-step tasks (Agentic workflows)",
+    "workflow orchestration":   "Automating multi-step tasks (Agentic workflows)",
+    "autonomous agents":        "Automating multi-step tasks (Agentic workflows)",
+    "multi-agent":              "Automating multi-step tasks (Agentic workflows)",
+    "agent building":           "Automating multi-step tasks (Agentic workflows)",
     # Translation-related
     "translation":              "Translating languages and practicing conversation",
     "language learning":        "Translating languages and practicing conversation",
+    "language translation":     "Translating languages and practicing conversation",
     # Brainstorming-related
     "brainstorming":            "Brainstorming and creative ideation",
     "ideation":                 "Brainstorming and creative ideation",
     "creative writing":         "Brainstorming and creative ideation",
+    "creative ideation":        "Brainstorming and creative ideation",
     # Scheduling-related
     "scheduling":               "Managing schedules and professional correspondence",
     "email":                    "Managing schedules and professional correspondence",
     "calendar":                 "Managing schedules and professional correspondence",
+    "email management":         "Managing schedules and professional correspondence",
+    "productivity":             "Managing schedules and professional correspondence",
     # Learning-related
     "learning":                 "Learning and studying",
     "education":                "Learning and studying",
     "tutoring":                 "Learning and studying",
+    "e-learning":               "Learning and studying",
+    "educational tools":        "Learning and studying",
     # Slides-related
     "presentations":            "Slides preparation",
     "slide creation":           "Slides preparation",
     "slide deck":               "Slides preparation",
+    "presentation design":      "Slides preparation",
 }
 
 
@@ -773,6 +833,19 @@ def _llm_extract_tools(text_chunk: str) -> tuple[list[dict], bool]:
               [{categories_str}]
               If the text describes multiple use cases, include all matching
               categories. If none clearly match, use the closest one.
+              CATEGORY HINTS — assign these when the text supports it:
+              • Image generators (e.g. Midjourney, DALL-E, Stable Diffusion,
+                Flux, Ideogram) → "Generating and editing images, videos, and audio"
+              • Video generators (e.g. Runway, Sora, Kling, Pika, Veo) →
+                "Generating and editing images, videos, and audio"
+              • Voice/audio/music tools (e.g. ElevenLabs, Suno, Udio, Lyria) →
+                "Generating and editing images, videos, and audio"
+              • Data analysis / code-interpreter features (e.g. ChatGPT
+                Advanced Data Analysis, Julius AI, Hex) →
+                "Analyzing and visualizing complex data"
+              • Agent frameworks and orchestration tools (e.g. CrewAI,
+                LangChain, LangGraph, AutoGen, MultiOn, Zapier Central,
+                n8n) → "Automating multi-step tasks (Agentic workflows)"
             - Do NOT invent or guess URLs that are not in the text.
             - Do NOT fabricate use cases — only report what the text states.
 
