@@ -725,6 +725,10 @@ def analyze_content(articles: list[dict], emails: list[dict]) -> dict:
 
     log.info("Extracted %d total tool mentions across %d chunks.", len(all_mentions), len(chunks))
 
+    # Phase 1b: filter out non-tool entities (newsletters, people, etc.)
+    all_mentions = _filter_non_tools(all_mentions)
+    log.info("After validation filter: %d tool mentions remain.", len(all_mentions))
+
     # Phase 2: deterministic ranking in Python (no LLM needed)
     tools_log = _rank_tools_deterministic(all_mentions)
     log.info("Ranked %d tools deterministically by distinct-source count.", len(tools_log))
@@ -822,6 +826,24 @@ def _llm_extract_tools(text_chunk: str) -> tuple[list[dict], bool]:
             every AI tool explicitly mentioned in the provided text.
 
             CRITICAL RULES:
+            - ONLY extract AI SOFTWARE TOOLS and PRODUCTS that are explicitly
+              named in the text below. A "tool" is a software product, app,
+              platform, or service that a user can sign up for or download
+              to accomplish tasks using AI.
+            - Do NOT extract any of the following — these are NOT tools:
+              • Newsletter names (e.g. "The Rundown", "Superhuman", "Ben's
+                Bites", "The Neuron", "TLDR", "Import AI", "Mindstream",
+                "Alpha Signal", "The Code Newsletter", "The Batch")
+              • People's names (e.g. journalists, CEOs, researchers, authors)
+              • Company/organisation names that are NOT a usable product
+                (e.g. "OpenAI", "Anthropic", "Google", "Meta", "DeepMind",
+                "Microsoft", "NVIDIA", "xAI" — but DO extract their products
+                like "ChatGPT", "Claude", "Gemini", "Llama")
+              • Generic concepts, frameworks, or research papers that are
+                not a standalone product users can access
+            - Do NOT combine or alter tool names — use the EXACT name from
+              the text. For example, do NOT output "Claude Mythos" if the
+              text only says "Claude".
             - ONLY extract tools that are explicitly named in the text below.
             - Do NOT add any tools from your own knowledge or training data.
             - The "source" field MUST be copied exactly from the nearest
@@ -923,7 +945,37 @@ def _llm_extract_tools(text_chunk: str) -> tuple[list[dict], bool]:
 
 
 # ---------------------------------------------------------------
-# 4a-2. Homepage URL filter
+# 4a-2. Non-tool entity blocklist
+# ---------------------------------------------------------------
+# Names that the LLM may mistakenly extract as AI tools. These include
+# newsletter names, author/journalist names, companies that are NOT
+# software products, and fabricated/hallucinated tool names.
+_NON_TOOL_BLOCKLIST: set[str] = {
+    # Newsletter / media names often extracted by mistake
+    "the code newsletter", "the neuron", "the rundown", "the rundown ai",
+    "superhuman", "ben's bites", "bens bites", "import ai", "mindstream",
+    "alpha signal", "alphasignal", "tldr", "tldr newsletter",
+    "the information", "the verge", "techcrunch", "wired",
+    "the code report", "the batch", "the algorithm",
+    # Author / journalist names commonly confused as tools
+    "halter", "attie", "sam altman", "sundar pichai", "elon musk",
+    "mark zuckerberg", "satya nadella", "jensen huang", "dario amodei",
+    "demis hassabis", "yann lecun", "andrew ng", "andrej karpathy",
+    # Fabricated / hallucinated tool names
+    "claude mythos", "gpt mythos",
+    # Companies / orgs that are NOT standalone AI tools
+    "openai", "anthropic", "google", "microsoft", "meta", "apple",
+    "nvidia", "amazon", "deepmind", "google deepmind", "xai",
+}
+
+
+def _is_blocked_tool(name: str) -> bool:
+    """Return True if *name* matches a known non-tool entity."""
+    return name.strip().lower() in _NON_TOOL_BLOCKLIST
+
+
+# ---------------------------------------------------------------
+# 4a-3. Homepage URL filter
 # ---------------------------------------------------------------
 # Hosting platforms / newsletter services that publish articles ABOUT tools
 # rather than being the tool's own homepage.
@@ -984,17 +1036,65 @@ def _is_homepage_url(url: str) -> bool:
 
 
 # ---------------------------------------------------------------
+# 4a-4. Post-extraction validation filter
+# ---------------------------------------------------------------
+def _filter_non_tools(mentions: list[dict]) -> list[dict]:
+    """Remove mentions that are not genuine AI software tools.
+
+    Applies the blocklist and heuristic checks to weed out newsletters,
+    people, companies, and hallucinated tool names that the LLM may have
+    incorrectly extracted.
+    """
+    filtered = []
+    removed_names: set[str] = set()
+    for m in mentions:
+        name = m.get("tool_name", "").strip()
+        if not name:
+            continue
+        # 1. Blocklist check
+        if _is_blocked_tool(name):
+            removed_names.add(name)
+            continue
+        # 2. Reject names that are too short (single character) or too long
+        #    (likely a sentence the LLM accidentally captured)
+        if len(name) < 2 or len(name) > 60:
+            removed_names.add(name)
+            continue
+        # 3. Reject names that look like sentences (contain 6+ words)
+        if len(name.split()) >= 6:
+            removed_names.add(name)
+            continue
+        # 4. Reject names that end with "newsletter" or "news" (case-insensitive)
+        lower = name.lower()
+        if lower.endswith("newsletter") or lower.endswith(" news"):
+            removed_names.add(name)
+            continue
+        filtered.append(m)
+    if removed_names:
+        log.info("Filtered out %d non-tool entities: %s",
+                 len(removed_names), ", ".join(sorted(removed_names)))
+    return filtered
+
+
+# ---------------------------------------------------------------
 # 4b. Deterministic Python ranking by distinct-source count
 # ---------------------------------------------------------------
 def _rank_tools_deterministic(mentions: list[dict]) -> list[dict]:
-    """Rank tools by count of distinct sources with positive sentiment.
+    """Rank tools by weighted score from distinct sources.
 
-    Sorting: primary = distinct positive source count (descending),
+    Positive-sentiment mentions count as 1.0 per distinct source.
+    Neutral-sentiment mentions count as 0.5 per distinct source.
+    Negative-sentiment mentions are excluded.
+
+    Sorting: primary = weighted score (descending),
              secondary = tool name alphabetical (ascending) for ties.
     Returns the top 25 tools.
     """
+    _SENTIMENT_WEIGHT = {"positive": 1.0, "neutral": 0.5}
+
     tool_data: dict[str, dict] = defaultdict(lambda: {
-        "sources": set(),
+        "positive_sources": set(),
+        "neutral_sources": set(),
         "descriptions": [],
         "use_cases": [],
         "urls": [],
@@ -1007,12 +1107,15 @@ def _rank_tools_deterministic(mentions: list[dict]) -> list[dict]:
         if not name:
             continue
         sentiment = m.get("sentiment", "").lower().strip()
-        if sentiment != "positive":
+        if sentiment not in _SENTIMENT_WEIGHT:
             continue
 
         key = name.lower()
         source = _canonical_source(m.get("source", "unknown"))
-        tool_data[key]["sources"].add(source)
+        if sentiment == "positive":
+            tool_data[key]["positive_sources"].add(source)
+        else:
+            tool_data[key]["neutral_sources"].add(source)
         # Keep the first-seen original casing
         if not tool_data[key]["original_name"]:
             tool_data[key]["original_name"] = name
@@ -1030,10 +1133,15 @@ def _rank_tools_deterministic(mentions: list[dict]) -> list[dict]:
             if normalised:
                 tool_data[key]["categories"].append(normalised)
 
-    # Sort: most distinct sources first, alphabetical for ties
+    def _weighted_score(data: dict) -> float:
+        # Neutral sources that are ALSO positive sources don't double-count
+        neutral_only = data["neutral_sources"] - data["positive_sources"]
+        return len(data["positive_sources"]) + 0.5 * len(neutral_only)
+
+    # Sort: highest weighted score first, alphabetical for ties
     ranked = sorted(
         tool_data.items(),
-        key=lambda x: (-len(x[1]["sources"]), x[0]),
+        key=lambda x: (-_weighted_score(x[1]), x[0]),
     )
 
     result = []
@@ -1043,10 +1151,11 @@ def _rank_tools_deterministic(mentions: list[dict]) -> list[dict]:
         for cat in data["categories"]:
             seen[cat] = seen.get(cat, 0) + 1
         unique_cats = sorted(seen.keys(), key=lambda c: -seen[c])
+        score = _weighted_score(data)
         result.append({
             "tool_name": data["original_name"] or key,
             "category": ", ".join(unique_cats) if unique_cats else "",
-            "mentions": len(data["sources"]),
+            "mentions": score,
             "use_cases": "; ".join(data["use_cases"][:5]) if data["use_cases"] else "N/A",
             "source_link": data["urls"][0] if data["urls"] else "N/A",
         })
@@ -1206,19 +1315,18 @@ def _rank_field_tools_deterministic(
     original article/email content.
     """
     fallback_urls = fallback_urls or {}
-    # Build a deduplicated summary of positive tools with per-category source
-    # counts.  `category_sources` maps each category to the set of distinct
-    # sources that mentioned the tool in that category's context, so ranking
-    # within a category reflects category-specific evidence, not the tool's
-    # overall popularity.
+    # Build a deduplicated summary of positive/neutral tools with per-category
+    # source counts.  Positive sources count as 1.0, neutral as 0.5.
     tool_info: dict[str, dict] = defaultdict(lambda: {
         "sources": set(), "descriptions": [], "use_cases": [],
         "urls": [], "categories": [], "original_name": "",
-        "category_sources": defaultdict(set),
+        "category_pos_sources": defaultdict(set),
+        "category_neu_sources": defaultdict(set),
     })
     for m in all_mentions:
         name = m.get("tool_name", "").strip()
-        if not name or m.get("sentiment", "").lower() != "positive":
+        sentiment = m.get("sentiment", "").lower().strip()
+        if not name or sentiment not in ("positive", "neutral"):
             continue
         key = name.lower()
         source = _canonical_source(m.get("source", ""))
@@ -1236,10 +1344,18 @@ def _rank_field_tools_deterministic(
             normalised = _normalize_category(cat) if cat else None
             if normalised:
                 tool_info[key]["categories"].append(normalised)
-                tool_info[key]["category_sources"][normalised].add(source)
+                if sentiment == "positive":
+                    tool_info[key]["category_pos_sources"][normalised].add(source)
+                else:
+                    tool_info[key]["category_neu_sources"][normalised].add(source)
+
+    def _cat_weighted_score(data: dict, category: str) -> float:
+        pos = data["category_pos_sources"].get(category, set())
+        neu = data["category_neu_sources"].get(category, set()) - pos
+        return len(pos) + 0.5 * len(neu)
 
     # For each category in the fixed list, collect tools whose extracted
-    # categories include it, then rank by distinct positive source count
+    # categories include it, then rank by weighted score
     # FOR THAT SPECIFIC CATEGORY (not the tool's overall source count).
     results: list[dict] = []
     for category in config.CATEGORIES:
@@ -1247,10 +1363,10 @@ def _rank_field_tools_deterministic(
         for key, data in tool_info.items():
             if category not in set(data["categories"]):
                 continue
-            cat_count = len(data["category_sources"][category])
-            candidates.append((key, data, cat_count))
+            cat_score = _cat_weighted_score(data, category)
+            candidates.append((key, data, cat_score))
 
-        # Sort: most distinct positive sources first, alphabetical for ties
+        # Sort: highest weighted score first, alphabetical for ties
         candidates.sort(key=lambda x: (-x[2], x[0]))
 
         for rank, (key, data, count) in enumerate(candidates[:5], start=1):
