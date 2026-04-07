@@ -828,12 +828,17 @@ def _llm_extract_tools(text_chunk: str) -> tuple[list[dict], bool]:
               [Source: ...] header above each article in the text.
             - If a tool is mentioned multiple times in the same source,
               include it only ONCE per source.
-            - "categories" must be determined ONLY from what the source text
-              says about the tool's use cases. Pick one or more from this list:
+            - "categories": pick one or more from this list:
               [{categories_str}]
-              If the text describes multiple use cases, include all matching
-              categories. If none clearly match, use the closest one.
-              CATEGORY HINTS — assign these when the text supports it:
+              First, use what the source text says about the tool's use cases
+              to choose the matching categories. If the text describes multiple
+              use cases, include all matching categories.
+              If the source text does NOT clearly describe the tool's use case
+              (e.g. it only announces an update or mentions the tool in
+              passing), use your own knowledge of the tool to assign the
+              correct categories — but NEVER invent a tool that is not in
+              the text.
+              CATEGORY HINTS — use these to resolve ambiguity:
               • Image generators (e.g. Midjourney, DALL-E, Stable Diffusion,
                 Flux, Ideogram) → "Generating and editing images, videos, and audio"
               • Video generators (e.g. Runway, Sora, Kling, Pika, Veo) →
