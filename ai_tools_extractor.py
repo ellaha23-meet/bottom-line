@@ -871,6 +871,34 @@ def _llm_extract_tools(text_chunk: str) -> tuple[list[dict], bool]:
             max_output_tokens=config.LLM_MAX_TOKENS,
             temperature=0.0,
             response_mime_type="application/json",
+            response_schema={
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "tool_name": {"type": "STRING"},
+                        "source": {"type": "STRING"},
+                        "sentiment": {
+                            "type": "STRING",
+                            "enum": ["positive", "neutral", "negative"],
+                        },
+                        "use_case": {"type": "STRING"},
+                        "categories": {
+                            "type": "ARRAY",
+                            "items": {
+                                "type": "STRING",
+                                "enum": config.CATEGORIES,
+                            },
+                        },
+                        "description": {"type": "STRING"},
+                        "url": {"type": "STRING"},
+                    },
+                    "required": [
+                        "tool_name", "source", "sentiment",
+                        "use_case", "categories", "description", "url",
+                    ],
+                },
+            },
         ),
     )
     response = model.generate_content(text_chunk)
