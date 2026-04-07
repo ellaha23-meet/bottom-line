@@ -594,6 +594,36 @@ def _normalize_category(raw: str) -> str | None:
     # Require at least 2 keyword matches to avoid false positives
     if best_score >= 2 and best_cat:
         return best_cat
+    # LLM fallback: ask the model to pick the best matching category
+    if _gemini_api_key_extract:
+        try:
+            _configure_gemini(_gemini_api_key_extract)
+            categories_str = ", ".join(f'"{c}"' for c in config.CATEGORIES)
+            model = genai.GenerativeModel(
+                model_name=config.LLM_MODEL,
+                system_instruction=(
+                    "You are a category classifier. Given a category label, "
+                    "return the single best matching category from the provided list. "
+                    "Return only the exact category string, nothing else."
+                ),
+                generation_config=genai.GenerationConfig(
+                    max_output_tokens=64,
+                    temperature=0.0,
+                    response_mime_type="application/json",
+                    response_schema={
+                        "type": "STRING",
+                        "enum": config.CATEGORIES,
+                    },
+                ),
+            )
+            response = model.generate_content(
+                f"Categories: [{categories_str}]\nLabel to match: \"{raw}\""
+            )
+            matched = response.text.strip().strip('"')
+            if matched in _CATEGORY_LOOKUP:
+                return _CATEGORY_LOOKUP[matched]
+        except Exception:
+            pass
     return None
 
 
